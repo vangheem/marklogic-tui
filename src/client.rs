@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use digest_auth::AuthContext;
 use reqwest::{Client, Method, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
@@ -127,8 +127,7 @@ impl MarkLogicClient {
             .to_header_string();
 
         // Retry with digest auth
-        let req = configure(self.client.request(method, url))
-            .header("Authorization", auth_header);
+        let req = configure(self.client.request(method, url)).header("Authorization", auth_header);
         let resp = req.send().await?;
 
         if !resp.status().is_success() {
@@ -168,7 +167,7 @@ impl MarkLogicClient {
         let db = self.database.as_deref().unwrap_or("Documents").to_string();
         let script = "JSON.stringify(Array.from(cts.collections()))";
         let url = self.system_url("/v1/eval");
-        let body_str = format!("javascript={}", script);
+        let body_str = format!("javascript={}", urlencoding::encode(script));
         let db_clone = db.clone();
         let resp = self
             .request_with_digest(Method::POST, &url, |r| {
@@ -206,7 +205,7 @@ impl MarkLogicClient {
     pub async fn js_query(&self, script: &str) -> Result<Vec<String>> {
         let db = self.database.as_deref().unwrap_or("Documents").to_string();
         let url = self.system_url("/v1/eval");
-        let body_str = format!("javascript={}", script);
+        let body_str = format!("javascript={}", urlencoding::encode(script));
         let db_clone = db.clone();
         let resp = self
             .request_with_digest(Method::POST, &url, |r| {
@@ -295,7 +294,7 @@ impl MarkLogicClient {
                 uris_json
             );
             let eval_url = self.system_url("/v1/eval");
-            let body_str = format!("javascript={}", script);
+            let body_str = format!("javascript={}", urlencoding::encode(&script));
             let db_clone2 = db.clone();
             if let Ok(resp) = self
                 .request_with_digest(Method::POST, &eval_url, |r| {
