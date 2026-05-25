@@ -682,16 +682,22 @@ impl App {
             .active_database
             .as_deref()
             .unwrap_or("(no database)");
-        let collection = self
-            .current_collection
-            .as_deref()
-            .map(|c| format!(" | Collection: {}", c))
-            .unwrap_or_default();
-        let query_file = format!(" | Query: {}", self.active_query_file_label());
-        format!(
-            "Mode: {} | Server: {} | Database: {}{}{} | {}",
-            mode, server, db, collection, query_file, self.status_message
-        )
+        let query_file = self.active_query_file_label();
+        let results = self.total_results.map(|n| format!("{} result(s)", n));
+        let parts: Vec<String> = [
+            Some(mode.to_string()),
+            Some(server.to_string()),
+            Some(db.to_string()),
+            self.current_collection.as_ref().map(|c| c.to_string()),
+            Some(query_file),
+            results,
+            Some(self.status_message.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+        format!("  {}", parts.join(" · "))
     }
 
     fn execute_command(&mut self) {
@@ -1213,34 +1219,16 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // status
+            Constraint::Length(1), // status
             Constraint::Length(3), // command
             Constraint::Min(0),    // main area
         ])
         .split(f.area());
 
-    // Status row: split into status (left) and keybinds (right)
-    let status_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[0]);
-
-    let status = Paragraph::new(app.status_line()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Status")
-            .border_style(Style::default().fg(Color::Blue)),
-    );
-    f.render_widget(status, status_chunks[0]);
-
-    let help_text = "1 command  2 query  3 results  i insert  Esc normal  / filter";
-    let keys = Paragraph::new(help_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Help")
-            .border_style(Style::default().fg(Color::Yellow)),
-    );
-    f.render_widget(keys, status_chunks[1]);
+    // Compact status line
+    let status = Paragraph::new(app.status_line())
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(status, chunks[0]);
 
     // Command / Filter input
     if app.focus == Focus::Filter {
