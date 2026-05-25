@@ -8,7 +8,8 @@ Browse documents, run JavaScript queries, manage collections, and interact with 
 
 - Browse and paginate documents across databases
 - Filter documents by collection or URI pattern
-- Execute JavaScript queries via MarkLogic's `/v1/eval` endpoint
+- Edit and run query files from the launch directory
+- Execute JavaScript and XQuery files via MarkLogic's `/v1/eval` endpoint
 - View documents full-screen with pretty-printed JSON/XML and metadata
 - Delete documents (multi-select + confirm)
 - Browse collections and drill into them
@@ -37,7 +38,7 @@ cargo build --release
 ## First-Time Setup
 
 1. Launch the app: `cargo run`
-2. Type `:servers` and press `Enter`
+2. Type `:servers` and press `Enter` (or `:server-add`)
 3. Press `a` to open the Add Server wizard
 4. Fill in the fields (Tab to advance between fields):
    - **Name** — a friendly label (e.g. `local`)
@@ -78,13 +79,16 @@ Type `:` followed by a command and press `Enter`. Tab-completion is available.
 | Command | Description |
 |---|---|
 | `:servers` | Open server management popup |
+| `:server-add` | Open the add server wizard directly |
 | `:databases` | List databases and open selection popup |
 | `:list` | List all documents (clears any active filters) |
 | `:collections` | Open collection browser |
 | `:list:<collection>` | List documents in a specific collection |
 | `:clear` | Clear collection/URI filters and reset pagination |
 | `:tdes` | List TDE (Template Driven Extraction) templates |
-| `:query` | Toggle the JavaScript query editor |
+| `:query` | Show the active query file editor |
+| `:query-files` | Open the query file picker |
+| `:query-open` | Open the query file picker |
 
 ## Keyboard Shortcuts
 
@@ -129,18 +133,28 @@ Type `:` followed by a command and press `Enter`. Tab-completion is available.
 | `Esc` | Cancel, return to results |
 | `Backspace` | Delete last character |
 
-### JavaScript Query Editor
+### Query Editor
 
 | Key | Action |
 |---|---|
 | `Alt+Enter` / `Ctrl+Enter` / `F5` | Execute the query |
+| `Ctrl+E` | Open the current query-pane contents in `$EDITOR`, then load the saved edits back |
+| `Ctrl+S` | Save the active query file immediately |
+| `Ctrl+O` | Open the query file picker |
 | `Esc` | Return focus to command input |
+
+Supported launch-directory file types: `.js`, `.mjs`, `.sjs`, `.xqy`, `.sql`, `.sparql`.
+
+- Phase 1 execution support: `.js`, `.mjs`, `.sjs`, `.xqy`
+- Phase 1 editing/switching only: `.sql`, `.sparql`
+- Editor changes autosave every 2 seconds after you stop typing
 
 ### Full-Screen Document View
 
 | Key | Action |
 |---|---|
 | `Esc` / `q` | Close and return to results |
+| `Ctrl+E` | Edit the current document in `$EDITOR` and save it back to MarkLogic |
 | `j` / `Down` | Scroll down one line |
 | `k` / `Up` | Scroll up one line |
 | `Space` / `PageDown` | Scroll down 20 lines |
