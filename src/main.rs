@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod query_file;
+mod query_result_cache;
 
 use anyhow::{Context, Result, bail};
 use client::{MarkLogicClient, SearchResult, ServerConfig};
@@ -18,15 +19,18 @@ use query_file::{
     is_supported_query_file, load_query_file, query_execution_kind, save_query_file,
     should_autosave,
 };
+use query_result_cache::{
+    QueryResultSnapshot, load_query_result_snapshot, move_query_result_cache,
+    remove_query_result_cache, save_query_result_snapshot,
+};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
-        block::Title,
     },
 };
 use std::{
@@ -63,6 +67,9 @@ enum AppMode {
     DeleteConfirm,
     QueryFileSelect,
     QueryFileCreate,
+    QueryFileRename,
+    QueryFileDeleteConfirm,
+    HelpOverlay,
 }
 
 struct App {
@@ -71,14 +78,20 @@ struct App {
     focus: Focus,
     edit_mode: EditMode,
     mode: AppMode,
+    previous_mode: Option<AppMode>,
     command_input: String,
     query_editor: TextArea<'static>,
     query_visible: bool,
     needs_terminal_refresh: bool,
     query_root_dir: PathBuf,
+    query_result_cache_dir: PathBuf,
     query_files: Vec<PathBuf>,
     active_query_file: Option<PathBuf>,
     query_file_list_state: ListState,
+    file_list_visible: bool,
+    file_delete_target: Option<PathBuf>,
+    rename_file_input: String,
+    rename_file_target: Option<PathBuf>,
     new_query_file_input: String,
     query_dirty: bool,
     query_last_edit: Option<Instant>,
@@ -104,6 +117,8 @@ struct App {
     active_document: Option<client::DocumentDetail>,
     full_view_content: String,
     full_view_scroll: u16,
+    last_fullscreen_g: Option<Instant>,
+    fullscreen_area_height: u16,
     // Server add wizard
     server_add_step: usize,
     server_add_fields: Vec<String>,
@@ -128,6 +143,7 @@ impl App {
         let config = AppConfig::load()?;
         let rt = Runtime::new()?;
         let query_root_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let query_result_cache_dir = query_root_dir.join(".marklogic-tui");
         let query_files = discover_query_files(&query_root_dir)?;
         let active_query_file = query_files.first().cloned();
         let client = config.active_server_config().map(|s| {
@@ -144,14 +160,20 @@ impl App {
             focus: Focus::Command,
             edit_mode: EditMode::Navigate,
             mode: AppMode::Normal,
+            previous_mode: None,
             command_input: String::new(),
             query_editor: Self::new_query_editor(Vec::new()),
             query_visible: false,
             needs_terminal_refresh: false,
             query_root_dir,
+            query_result_cache_dir,
             query_files,
             active_query_file,
             query_file_list_state: ListState::default(),
+            file_list_visible: true,
+            file_delete_target: None,
+            rename_file_input: String::new(),
+            rename_file_target: None,
             new_query_file_input: String::new(),
             query_dirty: false,
             query_last_edit: None,
@@ -174,6 +196,8 @@ impl App {
             active_document: None,
             full_view_content: String::new(),
             full_view_scroll: 0,
+            last_fullscreen_g: None,
+            fullscreen_area_height: 0,
             server_add_step: 0,
             server_add_fields: vec![String::new(); 5], // name, uri, user, pass, port
             autocomplete_suggestions: Vec::new(),
@@ -252,14 +276,21 @@ impl App {
     }
 
     fn update_autocomplete(&mut self) {
-        if self.command_input.starts_with(':') && self.command_input.len() > 1 {
-            let input = &self.command_input;
+        let normalized_input = if self.command_input.is_empty() {
+            String::new()
+        } else if self.command_input.starts_with(':') {
+            self.command_input.clone()
+        } else {
+            format!(":{}", self.command_input)
+        };
+
+        if normalized_input.len() > 1 {
             self.autocomplete_suggestions = Self::COMMANDS
                 .iter()
-                .filter(|(cmd, _)| cmd.starts_with(input))
+                .filter(|(cmd, _)| cmd.starts_with(&normalized_input))
                 .map(|(cmd, _)| *cmd)
                 .collect();
-        } else if self.command_input == ":" {
+        } else if normalized_input == ":" {
             self.autocomplete_suggestions = Self::COMMANDS.iter().map(|(cmd, _)| *cmd).collect();
         } else {
             self.autocomplete_suggestions.clear();
@@ -278,9 +309,6 @@ impl App {
                 .and_then(|active| self.query_files.iter().position(|path| path == active))
                 .unwrap_or(0);
             self.query_file_list_state.select(Some(selected));
-            if self.active_query_file.is_none() {
-                self.active_query_file = self.query_files.get(selected).cloned();
-            }
         }
         Ok(())
     }
@@ -293,17 +321,8 @@ impl App {
     }
 
     fn query_title(&self) -> String {
-        let dirty = if self.query_dirty { " *" } else { "" };
-        let shortcuts = match self.edit_mode {
-            EditMode::Navigate => "i:insert mode|F4:editor|o:switch file|n:new|r/F5:run",
-            EditMode::Insert => "ESC:Normal mode|Ctrl-r:Run|Ctrl-o:switch file",
-        };
-        format!(
-            "Query [{}{}] [{}]",
-            self.active_query_file_label(),
-            dirty,
-            shortcuts
-        )
+        let dirty = if self.query_dirty { "*" } else { "" };
+        format!("Query: {}{}", self.active_query_file_label(), dirty)
     }
 
     fn edit_mode_label(&self) -> &'static str {
@@ -322,11 +341,23 @@ impl App {
         self.query_visible = true;
         self.focus = Focus::Query;
         self.edit_mode = EditMode::Navigate;
+        if self.query_file_list_state.selected().is_none() && !self.query_files.is_empty() {
+            let selected = self
+                .active_query_file
+                .as_ref()
+                .and_then(|active| self.query_files.iter().position(|path| path == active))
+                .unwrap_or(0);
+            self.query_file_list_state.select(Some(selected));
+        }
     }
 
     fn focus_results_panel(&mut self) {
         self.focus = Focus::Results;
         self.edit_mode = EditMode::Navigate;
+    }
+
+    fn toggle_file_list(&mut self) {
+        self.file_list_visible = !self.file_list_visible;
     }
 
     fn cycle_panel_focus(&mut self) {
@@ -494,8 +525,116 @@ impl App {
         }
     }
 
+    fn delete_query_file(&mut self, path: PathBuf) {
+        if let Err(e) = fs::remove_file(&path) {
+            self.status_message = format!("Failed to delete file: {}", e);
+            return;
+        }
+
+        let cache_warning =
+            remove_query_result_cache(&self.query_result_cache_dir, &self.query_root_dir, &path)
+                .err()
+                .map(|e| e.to_string());
+
+        self.status_message = format!(
+            "Deleted query file: {}",
+            display_query_path(&path, &self.query_root_dir)
+        );
+        if let Some(warning) = cache_warning {
+            self.status_message
+                .push_str(&format!(" (cache cleanup warning: {})", warning));
+        }
+        if self.active_query_file.as_ref() == Some(&path) {
+            self.active_query_file = None;
+            self.query_editor = Self::new_query_editor(Vec::new());
+            self.query_dirty = false;
+            self.query_last_edit = None;
+        }
+        if let Err(e) = self.refresh_query_files() {
+            self.status_message = format!("Deleted file but failed to refresh list: {}", e);
+        }
+    }
+
+    fn start_rename_query_file(&mut self) {
+        if let Some(sel) = self.query_file_list_state.selected() {
+            if let Some(path) = self.query_files.get(sel).cloned() {
+                let name = display_query_path(&path, &self.query_root_dir);
+                self.rename_file_input = name;
+                self.rename_file_target = Some(path);
+                self.mode = AppMode::QueryFileRename;
+            }
+        }
+    }
+
+    fn rename_query_file(&mut self) {
+        let Some(old_path) = self.rename_file_target.take() else {
+            self.mode = AppMode::Normal;
+            return;
+        };
+        let new_name = self.rename_file_input.trim().to_string();
+        if new_name.is_empty() {
+            self.status_message = "Enter a file name.".to_string();
+            self.mode = AppMode::Normal;
+            return;
+        }
+
+        let file_path = Path::new(&new_name);
+        if file_path.components().count() != 1 {
+            self.status_message =
+                "Enter a file name only, not a nested or absolute path.".to_string();
+            self.mode = AppMode::Normal;
+            return;
+        }
+
+        let new_path = self.query_root_dir.join(file_path);
+        if new_path.exists() {
+            self.status_message = format!(
+                "File already exists: {}",
+                display_query_path(&new_path, &self.query_root_dir)
+            );
+            self.mode = AppMode::Normal;
+            return;
+        }
+
+        if let Err(e) = fs::rename(&old_path, &new_path) {
+            self.status_message = format!("Failed to rename file: {}", e);
+            self.mode = AppMode::Normal;
+            return;
+        }
+
+        if self.active_query_file.as_ref() == Some(&old_path) {
+            self.active_query_file = Some(new_path.clone());
+        }
+
+        let cache_move_warning = move_query_result_cache(
+            &self.query_result_cache_dir,
+            &self.query_root_dir,
+            &old_path,
+            &new_path,
+        )
+        .err()
+        .map(|e| e.to_string());
+
+        if let Err(e) = self.refresh_query_files() {
+            self.status_message = format!("Renamed file but failed to refresh list: {}", e);
+        } else {
+            self.status_message = format!(
+                "Renamed to: {}",
+                display_query_path(&new_path, &self.query_root_dir)
+            );
+            if let Some(warning) = cache_move_warning {
+                self.status_message
+                    .push_str(&format!(" (cache move warning: {})", warning));
+            }
+        }
+        self.mode = AppMode::Normal;
+    }
+
     fn set_query_results(&mut self, results: Vec<String>) {
         self.records.clear();
+        self.list_state.select(None);
+        self.selected_indices.clear();
+        self.total_results = None;
         self.query_results = results;
         self.query_results_state
             .select(if self.query_results.is_empty() {
@@ -505,7 +644,64 @@ impl App {
             });
         self.last_query_results_g = None;
         self.results_text.clear();
-        self.status_message = format!("{} result(s)", self.query_results.len());
+        self.status_message = "Query executed".to_string();
+    }
+
+    fn clear_query_results_view(&mut self) {
+        self.records.clear();
+        self.list_state.select(None);
+        self.selected_indices.clear();
+        self.total_results = None;
+        self.query_results.clear();
+        self.query_results_state.select(None);
+        self.last_query_results_g = None;
+        self.results_text.clear();
+    }
+
+    fn persist_query_results_for_path(&mut self, path: &Path) {
+        let snapshot = QueryResultSnapshot {
+            query_results: self.query_results.clone(),
+            selected_index: self.query_results_state.selected(),
+        };
+
+        if let Err(e) = save_query_result_snapshot(
+            &self.query_result_cache_dir,
+            &self.query_root_dir,
+            path,
+            &snapshot,
+        ) {
+            self.status_message = format!("Query executed, but failed to cache results: {}", e);
+        }
+    }
+
+    fn restore_query_results_for_path(&mut self, path: &Path) -> Result<Option<usize>> {
+        let snapshot =
+            load_query_result_snapshot(&self.query_result_cache_dir, &self.query_root_dir, path)?;
+
+        if let Some(snapshot) = snapshot {
+            self.records.clear();
+            self.list_state.select(None);
+            self.selected_indices.clear();
+            self.total_results = None;
+            self.query_results = snapshot.query_results;
+            let selected = snapshot
+                .selected_index
+                .filter(|idx| *idx < self.query_results.len())
+                .or_else(|| {
+                    if self.query_results.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    }
+                });
+            self.query_results_state.select(selected);
+            self.last_query_results_g = None;
+            self.results_text.clear();
+            Ok(Some(self.query_results.len()))
+        } else {
+            self.clear_query_results_view();
+            Ok(None)
+        }
     }
 
     fn set_active_document(&mut self, detail: client::DocumentDetail) {
@@ -571,13 +767,30 @@ impl App {
         let contents = load_query_file(&path)?;
         self.query_editor = Self::new_query_editor(editor_lines(&contents));
         self.active_query_file = Some(path.clone());
+        let restored_results = self.restore_query_results_for_path(&path);
         self.query_dirty = false;
         self.query_last_edit = None;
         self.focus_query_panel();
-        self.status_message = format!(
-            "Loaded query file: {}",
-            display_query_path(&path, &self.query_root_dir)
-        );
+        self.status_message = match restored_results {
+            Ok(Some(count)) => format!(
+                "Loaded query file: {} (restored {} cached result{})",
+                display_query_path(&path, &self.query_root_dir),
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            Ok(None) => format!(
+                "Loaded query file: {}",
+                display_query_path(&path, &self.query_root_dir)
+            ),
+            Err(e) => {
+                self.clear_query_results_view();
+                format!(
+                    "Loaded query file: {} (failed to restore cached results: {})",
+                    display_query_path(&path, &self.query_root_dir),
+                    e
+                )
+            }
+        };
         Ok(())
     }
 
@@ -670,8 +883,13 @@ impl App {
         }
     }
 
-    fn status_line(&self) -> String {
-        let mode = self.edit_mode_label();
+    fn status_line(&self) -> Line<'static> {
+        let mode_span = match self.edit_mode {
+            EditMode::Navigate => Span::styled("NORMAL", Style::default().fg(Color::White)),
+            EditMode::Insert => {
+                Span::styled("INSERT", Style::default().fg(Color::White).bg(Color::Red))
+            }
+        };
         let server = self
             .config
             .active_server
@@ -682,27 +900,35 @@ impl App {
             .active_database
             .as_deref()
             .unwrap_or("(no database)");
-        let query_file = self.active_query_file_label();
-        let results = self.total_results.map(|n| format!("{} result(s)", n));
         let parts: Vec<String> = [
-            Some(mode.to_string()),
             Some(server.to_string()),
             Some(db.to_string()),
             self.current_collection.as_ref().map(|c| c.to_string()),
-            Some(query_file),
-            results,
             Some(self.status_message.clone()),
         ]
         .into_iter()
         .flatten()
         .filter(|s| !s.is_empty())
         .collect();
-        format!("  {}", parts.join(" · "))
+        let joined = parts.join(" · ");
+        Line::from(vec![
+            Span::raw("  "),
+            mode_span,
+            Span::raw(format!(" · {}", joined)),
+        ])
     }
 
     fn execute_command(&mut self) {
-        let cmd = self.command_input.trim().to_string();
+        let mut cmd = self.command_input.trim().to_string();
         self.command_input.clear();
+
+        if cmd.is_empty() {
+            return;
+        }
+
+        if !cmd.starts_with(':') && self.focus == Focus::Command {
+            cmd = format!(":{}", cmd);
+        }
 
         if !cmd.starts_with(':') {
             // It's a filter for current results
@@ -920,12 +1146,7 @@ impl App {
                     });
                     self.selected_indices.clear();
                     self.focus_results_panel();
-                    let total_str = paged
-                        .total
-                        .map(|t| t.to_string())
-                        .unwrap_or("?".to_string());
-                    self.status_message =
-                        format!("Page {} | Total: {}", self.current_page + 1, total_str);
+                    self.status_message = String::new();
                 }
                 Err(e) => {
                     self.results_text = format!("Error: {}", e);
@@ -994,9 +1215,11 @@ impl App {
             match result {
                 Ok(parts) => {
                     self.set_query_results(parts);
+                    self.persist_query_results_for_path(&path);
                 }
                 Err(e) => {
                     self.query_results.clear();
+                    self.query_results_state.select(None);
                     self.results_text = format!("Query error: {}", e);
                 }
             }
@@ -1201,6 +1424,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         AppMode::DeleteConfirm => ui_delete_confirm(f, app),
         AppMode::QueryFileSelect => ui_query_file_select(f, app),
         AppMode::QueryFileCreate => ui_query_file_create(f, app),
+        AppMode::QueryFileRename => ui_query_file_rename(f, app),
+        AppMode::QueryFileDeleteConfirm => ui_query_file_delete_confirm(f, app),
+        AppMode::HelpOverlay => ui_help(f, app),
         AppMode::Normal => ui_normal(f, app),
     }
 }
@@ -1209,72 +1435,129 @@ fn panel_block<T>(title: T, shortcut: &'static str) -> Block<'static>
 where
     T: Into<Line<'static>>,
 {
-    Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .title(Title::from(Line::from(shortcut)).alignment(Alignment::Right))
+    let title_line: Line<'static> = Line::from(vec![
+        Span::raw(shortcut),
+        Span::raw("─ "),
+        title.into().spans.into_iter().next().unwrap_or_default(),
+    ]);
+    Block::default().borders(Borders::ALL).title(title_line)
+}
+
+fn keybindings_text(focus: &Focus, edit_mode: &EditMode) -> String {
+    let mut parts = Vec::new();
+    match focus {
+        Focus::Command => {
+            parts.push("Execute: Enter".to_string());
+            parts.push("Complete: Tab".to_string());
+            parts.push("Clear: Esc".to_string());
+        }
+        Focus::Query => {
+            if *edit_mode == EditMode::Insert {
+                parts.push("Normal: Esc".to_string());
+                parts.push("Run: ^R".to_string());
+                parts.push("Save: ^S".to_string());
+            } else {
+                parts.push("Insert: i".to_string());
+                parts.push("Run: r".to_string());
+                parts.push("Editor: F4".to_string());
+                parts.push("New: n".to_string());
+            }
+        }
+        Focus::Results => {
+            parts.push("Open: Enter".to_string());
+            parts.push("Select: Space".to_string());
+            parts.push("Page: n/p".to_string());
+            parts.push("Filter: /".to_string());
+            parts.push("Delete: ^D".to_string());
+        }
+        Focus::Filter => {
+            parts.push("Apply: Enter".to_string());
+            parts.push("Cancel: Esc".to_string());
+        }
+    }
+    parts.push("Keybindings: ?".to_string());
+    parts.join(" | ")
 }
 
 fn ui_normal(f: &mut Frame, app: &mut App) {
+    // Command line is hidden unless focused, filtering, or has content
+    let cmd_visible = app.focus == Focus::Command
+        || app.focus == Focus::Filter
+        || !app.command_input.is_empty()
+        || app.uri_filter.is_some();
+    let cmd_height = if cmd_visible { 1 } else { 0 };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // status
-            Constraint::Length(3), // command
-            Constraint::Min(0),    // main area
+            Constraint::Length(1),          // merged status + keybindings bar
+            Constraint::Min(0),             // main area
+            Constraint::Length(cmd_height), // command (at bottom, collapsible)
         ])
         .split(f.area());
 
-    // Compact status line
-    let status = Paragraph::new(app.status_line())
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(status, chunks[0]);
+    // Merged top bar: status on left, keybindings on right
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[0]);
+    let status = Paragraph::new(app.status_line());
+    f.render_widget(status, top_chunks[0]);
+    let kb_text = keybindings_text(&app.focus, &app.edit_mode);
+    let kb_bar = Paragraph::new(kb_text)
+        .style(Style::default().fg(Color::Cyan))
+        .alignment(Alignment::Right);
+    f.render_widget(kb_bar, top_chunks[1]);
 
-    // Command / Filter input
-    if app.focus == Focus::Filter {
-        let filter_display = format!("/{}", app.filter_input);
-        let filter_widget = Paragraph::new(filter_display.as_str()).block(
-            panel_block("Filter URI [Enter apply, Esc cancel]", "[1]")
-                .border_style(Style::default().fg(Color::Green)),
-        );
-        f.render_widget(filter_widget, chunks[1]);
-        let cursor_x = chunks[1].x + app.filter_input.len() as u16 + 2; // +1 border +1 for '/'
-        let cursor_y = chunks[1].y + 1;
-        f.set_cursor_position((cursor_x, cursor_y));
-    } else {
-        let cmd_style = Style::default().fg(Color::Magenta);
-        let title = if let Some(ref filter) = app.uri_filter {
-            format!(
-                "Command [: commands, Enter run, Tab complete] | Filter: {}",
-                filter
-            )
-        } else {
-            "Command [: commands, Enter run, Tab complete]".to_string()
-        };
-        let command = Paragraph::new(app.command_input.as_str())
-            .block(panel_block(title, "[1]").border_style(cmd_style));
-        f.render_widget(command, chunks[1]);
-
-        // Show cursor in command input when focused
-        if app.focus == Focus::Command {
-            let cursor_x = chunks[1].x + app.command_input.len() as u16 + 1;
-            let cursor_y = chunks[1].y + 1;
-            f.set_cursor_position((cursor_x, cursor_y));
-        }
-    }
-
-    // Main area: query on top (if visible), results on bottom
+    // Content area: query on top (if visible), results on bottom
     let main_chunks = if app.query_visible {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-            .split(chunks[2])
+            .split(chunks[1])
     } else {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0)])
-            .split(chunks[2])
+            .split(chunks[1])
     };
+
+    // Command / Filter input (at bottom)
+    if cmd_visible {
+        if app.focus == Focus::Filter {
+            let filter_style = Style::default().fg(Color::White).bg(Color::Rgb(0, 90, 0));
+            f.render_widget(Block::default().style(filter_style), chunks[2]);
+            let filter_display = format!("/{}", app.filter_input);
+            let filter_widget = Paragraph::new(filter_display.as_str()).style(filter_style);
+            f.render_widget(filter_widget, chunks[2]);
+            let cursor_x = chunks[2].x + app.filter_input.chars().count() as u16 + 1;
+            let cursor_y = chunks[2].y;
+            f.set_cursor_position((cursor_x, cursor_y));
+        } else {
+            let command_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+            f.render_widget(Block::default().style(command_style), chunks[2]);
+
+            let command_input = app
+                .command_input
+                .strip_prefix(':')
+                .unwrap_or(app.command_input.as_str());
+            let mut command_line = format!(":{}", command_input);
+            if let Some(ref filter) = app.uri_filter {
+                if !filter.is_empty() {
+                    command_line.push_str(&format!("  [filter: {}]", filter));
+                }
+            }
+            let command = Paragraph::new(command_line).style(command_style);
+            f.render_widget(command, chunks[2]);
+
+            // Show cursor in command input when focused
+            if app.focus == Focus::Command {
+                let cursor_x = chunks[2].x + command_input.chars().count() as u16 + 1;
+                let cursor_y = chunks[2].y;
+                f.set_cursor_position((cursor_x, cursor_y));
+            }
+        }
+    }
 
     let results_area = if app.query_visible {
         main_chunks[1]
@@ -1283,14 +1566,42 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
     };
 
     if app.query_visible {
-        // Query input
+        // Query panel: optionally split horizontally for file list
+        let should_show_file_list = app.file_list_visible && app.edit_mode == EditMode::Navigate;
+        let (editor_area, file_list_area) = if should_show_file_list {
+            let hchunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(30)])
+                .split(main_chunks[0]);
+            (hchunks[0], Some(hchunks[1]))
+        } else {
+            (main_chunks[0], None)
+        };
+
+        // Query editor (left side, or full width if no file list)
         let border_style = if app.focus == Focus::Query {
             Style::default().fg(Color::Yellow)
         } else {
-            Style::default()
+            Style::default().fg(Color::DarkGray)
         };
-        app.query_editor
-            .set_block(panel_block(app.query_title(), "[2]").border_style(border_style));
+        let editor_bg = if app.edit_mode == EditMode::Insert {
+            Color::Black
+        } else {
+            Color::Rgb(35, 35, 35)
+        };
+        let query_block = if should_show_file_list {
+            let title_line = Line::from(vec![Span::raw("[2]─ "), Span::raw(app.query_title())]);
+            Block::default()
+                .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
+                .title(title_line)
+                .border_style(border_style)
+                .style(Style::default().bg(editor_bg))
+        } else {
+            panel_block(app.query_title(), "[2]")
+                .border_style(border_style)
+                .style(Style::default().bg(editor_bg))
+        };
+        app.query_editor.set_block(query_block);
         app.query_editor.set_cursor_line_style(Style::default());
         if app.focus == Focus::Query && app.edit_mode == EditMode::Insert {
             app.query_editor
@@ -1298,14 +1609,54 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
         } else {
             app.query_editor.set_cursor_style(Style::default());
         }
-        f.render_widget(&app.query_editor, main_chunks[0]);
+        f.render_widget(&app.query_editor, editor_area);
+
+        // File list (right side)
+        if let Some(area) = file_list_area {
+            let file_list_style =
+                if app.focus == Focus::Query && app.edit_mode == EditMode::Navigate {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+
+            let items: Vec<ListItem> = app
+                .query_files
+                .iter()
+                .map(|path| {
+                    let is_active = app.active_query_file.as_ref() == Some(path);
+                    let name = display_query_path(path, &app.query_root_dir);
+                    let marker = if is_active { " *" } else { "" };
+                    let text = format!("{}{}", name, marker);
+                    let style = if is_active {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(text).style(style)
+                })
+                .collect();
+
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP | Borders::RIGHT | Borders::BOTTOM)
+                        .title("Files")
+                        .border_style(file_list_style)
+                        .style(Style::default().bg(Color::Black)),
+                )
+                .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+                .highlight_symbol("> ");
+            f.render_stateful_widget(list, area, &mut app.query_file_list_state);
+        }
+        f.render_widget(&app.query_editor, editor_area);
     } // end if query_visible
 
     // Results area
     let results_style = if app.focus == Focus::Results {
         Style::default().fg(Color::Yellow)
     } else {
-        Style::default()
+        Style::default().fg(Color::DarkGray)
     };
 
     // Dynamic page size based on available height (subtract borders + header row)
@@ -1332,6 +1683,8 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD)
+                } else if i % 2 == 0 {
+                    Style::default().bg(Color::Rgb(30, 30, 30))
                 } else {
                     Style::default()
                 };
@@ -1339,7 +1692,7 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
             })
             .collect();
 
-        let title = "Results [Space select, Enter view, Ctrl+D delete, n/p page, / filter]";
+        let title = "Results";
         let header = Row::new(vec!["", "URI", "Collections"]).style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
@@ -1350,9 +1703,18 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
             Constraint::Percentage(45),
             Constraint::Percentage(50),
         ];
+        let total_str = app
+            .total_results
+            .map(|t| t.to_string())
+            .unwrap_or("?".to_string());
+        let page_title = format!("Page {} | Total: {}", app.current_page + 1, total_str);
         let table = Table::new(rows, widths)
             .header(header)
-            .block(panel_block(title, "[3]").border_style(results_style))
+            .block(
+                panel_block(title, "[3]")
+                    .border_style(results_style)
+                    .title(Line::from(page_title).alignment(Alignment::Right)),
+            )
             .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
             .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
         f.render_stateful_widget(table, results_area, &mut app.list_state);
@@ -1367,11 +1729,17 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
                 let max_width = results_area.width.saturating_sub(9) as usize;
                 let snippet = make_snippet(result, max_width);
                 let num = format!("{}", i + 1);
-                Row::new(vec![num, snippet])
+                let style = if i % 2 == 0 {
+                    Style::default().bg(Color::Rgb(30, 30, 30))
+                } else {
+                    Style::default()
+                };
+                Row::new(vec![num, snippet]).style(style)
             })
             .collect();
 
-        let title = "Query Results [Enter view full, j/k navigate, Tab focus query]";
+        let count = app.total_results.unwrap_or(app.query_results.len());
+        let title = format!("Query Results ({})", count);
         let header = Row::new(vec!["#", "Result"]).style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
@@ -1414,9 +1782,9 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
             .collect();
         let height = (items.len() as u16 + 2).min(12); // +2 for borders
         let popup_area = Rect {
-            x: chunks[1].x,
-            y: chunks[1].y + chunks[1].height,
-            width: chunks[1].width.min(70),
+            x: chunks[2].x,
+            y: chunks[2].y.saturating_sub(height),
+            width: chunks[2].width.min(70),
             height,
         };
         let list =
@@ -1426,18 +1794,54 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn ui_fullscreen(f: &mut Frame, app: &App) {
-    let title = if app.active_document.is_some() {
-        "Document View [Esc to close, Ctrl+E to edit, j/k or arrows to scroll]"
+fn ui_fullscreen(f: &mut Frame, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(f.area());
+
+    // Top row: status left, keybindings right
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[0]);
+
+    let total_lines = app.full_view_content.lines().count() as u16;
+    let content_height = chunks[1].height.saturating_sub(2);
+    let max_scroll = total_lines.saturating_sub(content_height);
+    let pct = if max_scroll == 0 {
+        100
     } else {
-        "Document View [Esc to close, j/k or arrows to scroll]"
+        ((app.full_view_scroll as f32 / max_scroll as f32) * 100.0) as u16
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    app.fullscreen_area_height = chunks[1].height;
+
+    let status = Paragraph::new(app.status_line());
+    f.render_widget(status, top_chunks[0]);
+
+    let mut kb_parts = vec![
+        "Close: Esc/q".to_string(),
+        "j/k: scroll".to_string(),
+        "d/u: page".to_string(),
+        "gg/G: top/bottom".to_string(),
+    ];
+    if app.active_document.is_some() {
+        kb_parts.push("^E: edit".to_string());
+    }
+    kb_parts.push(format!("{}%", pct));
+    let kb_bar = Paragraph::new(kb_parts.join(" | "))
+        .style(Style::default().fg(Color::Cyan))
+        .alignment(Alignment::Right);
+    f.render_widget(kb_bar, top_chunks[1]);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Document View");
     let para = Paragraph::new(app.full_view_content.as_str())
         .block(block)
         .wrap(Wrap { trim: false })
         .scroll((app.full_view_scroll, 0));
-    f.render_widget(para, f.area());
+    f.render_widget(para, chunks[1]);
 }
 
 fn ui_database_select(f: &mut Frame, app: &mut App) {
@@ -1461,7 +1865,7 @@ fn ui_database_select(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Select Database [Enter=select, Esc=cancel]"),
+                .title("Select Database"),
         )
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol("> ");
@@ -1489,7 +1893,7 @@ fn ui_collection_select(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Select Collection [Enter=list, Esc=cancel]"),
+                .title("Select Collection"),
         )
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol("> ");
@@ -1521,7 +1925,7 @@ fn ui_query_file_select(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Select Query File [Enter=load, Esc=cancel]"),
+                .title("Select Query File"),
         )
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol("> ");
@@ -1535,13 +1939,48 @@ fn ui_query_file_create(f: &mut Frame, app: &App) {
     let input = Paragraph::new(app.new_query_file_input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("New Query File [Enter=create, Esc=cancel]"),
+            .title("New Query File"),
     );
     f.render_widget(input, area);
     f.set_cursor_position((
         area.x + app.new_query_file_input.len() as u16 + 1,
         area.y + 1,
     ));
+}
+
+fn ui_query_file_rename(f: &mut Frame, app: &App) {
+    let area = centered_rect(60, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let input = Paragraph::new(app.rename_file_input.as_str())
+        .block(Block::default().borders(Borders::ALL).title("Rename File"));
+    f.render_widget(input, area);
+    f.set_cursor_position((area.x + app.rename_file_input.len() as u16 + 1, area.y + 1));
+}
+
+fn ui_query_file_delete_confirm(f: &mut Frame, app: &App) {
+    let area = centered_rect(60, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let file_name = app
+        .file_delete_target
+        .as_ref()
+        .map(|p| display_query_path(p, &app.query_root_dir))
+        .unwrap_or_else(|| "(unknown)".to_string());
+
+    let text = format!(
+        "Delete query file '{}' ?\n\nPress 'y' to confirm, 'n' or Esc to cancel",
+        file_name
+    );
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Confirm File Delete")
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
 }
 
 fn ui_delete_confirm(f: &mut Frame, app: &App) {
@@ -1579,11 +2018,7 @@ fn ui_server_select(f: &mut Frame, app: &mut App) {
         .collect();
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Servers [Enter=switch, a=add, d=remove, Esc=close]"),
-        )
+        .block(Block::default().borders(Borders::ALL).title("Servers"))
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut app.server_list_state);
@@ -1615,7 +2050,7 @@ fn ui_server_add(f: &mut Frame, app: &App) {
         let style = if i == app.server_add_step {
             Style::default().fg(Color::Yellow)
         } else {
-            Style::default()
+            Style::default().fg(Color::DarkGray)
         };
         let display = if i == 3 {
             "*".repeat(app.server_add_fields[i].len())
@@ -1630,6 +2065,109 @@ fn ui_server_add(f: &mut Frame, app: &App) {
         );
         f.render_widget(p, chunks[i]);
     }
+}
+
+fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode) -> Vec<&'static str> {
+    let mut lines = vec![
+        "",
+        "  Global",
+        "    ?          Show/hide this help",
+        "    :          Open command input",
+        "    1          Focus command panel",
+        "    2          Focus query panel",
+        "    3          Focus results panel",
+        "    \\          Toggle file list",
+        "    Tab        Cycle focus forward",
+        "    Shift+Tab  Cycle focus backward",
+        "",
+    ];
+
+    match focus {
+        Focus::Command => {
+            lines.extend_from_slice(&[
+                "  Command Panel",
+                "    Enter      Execute command",
+                "    Tab        Accept autocomplete / cycle panels",
+                "    Up/Down    Navigate autocomplete",
+                "    Esc        Clear input",
+                "",
+            ]);
+        }
+        Focus::Query => {
+            if *edit_mode == EditMode::Insert {
+                lines.extend_from_slice(&[
+                    "  Query Panel (Insert Mode)",
+                    "    Esc        Return to normal mode",
+                    "    Ctrl+T     Cycle focus",
+                    "    Ctrl+R     Run query",
+                    "    Ctrl+S     Save query file",
+                    "    Ctrl+O     Switch query file",
+                    "",
+                ]);
+            } else {
+                lines.extend_from_slice(&[
+                    "  Query Panel (Normal Mode)",
+                    "    i          Enter insert mode (editor)",
+                    "    j/k        Navigate + auto-load file",
+                    "    Enter      Load selected file",
+                    "    n          New query file",
+                    "    m          Rename selected file",
+                    "    Delete     Delete selected file",
+                    "    r / F5     Run query",
+                    "    F4         Open in external editor",
+                    "    \\          Toggle file list",
+                    "    g/G        Go to top/bottom of file list",
+                    "",
+                ]);
+            }
+        }
+        Focus::Results => {
+            lines.extend_from_slice(&[
+                "  Results Panel",
+                "    Enter      Open selected document",
+                "    j/k        Navigate up/down",
+                "    d          Page down",
+                "    u          Page up",
+                "    n / p      Next/previous page",
+                "    Space      Toggle selection",
+                "    /          Filter results",
+                "    Ctrl+D     Delete selected",
+                "    g          Go to top (double-tap)",
+                "    G          Go to bottom",
+                "",
+            ]);
+        }
+        Focus::Filter => {
+            lines.extend_from_slice(&[
+                "  Filter Panel",
+                "    Enter      Apply filter",
+                "    Esc        Cancel filter",
+                "",
+            ]);
+        }
+    }
+
+    lines.push("  Press ? or Esc to close this help");
+    lines.into()
+}
+
+fn ui_help(f: &mut Frame, app: &App) {
+    let area = centered_rect(60, 70, f.area());
+    f.render_widget(Clear, area);
+
+    let help_lines = help_text_for_focus(&app.focus, &app.edit_mode);
+    let text = help_lines.join("\n");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Keybindings")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let para = Paragraph::new(text)
+        .block(block)
+        .style(Style::default().fg(Color::Gray));
+
+    f.render_widget(para, area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1672,7 +2210,28 @@ fn handle_event(app: &mut App) -> Result<bool> {
                 AppMode::DeleteConfirm => return handle_delete_confirm_key(app, key),
                 AppMode::QueryFileSelect => return handle_query_file_select_key(app, key),
                 AppMode::QueryFileCreate => return handle_query_file_create_key(app, key),
+                AppMode::QueryFileRename => return handle_query_file_rename_key(app, key),
+                AppMode::QueryFileDeleteConfirm => {
+                    return handle_query_file_delete_confirm_key(app, key);
+                }
+                AppMode::HelpOverlay => {
+                    if key.code == KeyCode::Char('?') || key.code == KeyCode::Esc {
+                        if let Some(prev) = app.previous_mode.take() {
+                            app.mode = prev;
+                        } else {
+                            app.mode = AppMode::Normal;
+                        }
+                    }
+                    return Ok(false);
+                }
                 AppMode::Normal => {}
+            }
+
+            // Global help overlay
+            if key.code == KeyCode::Char('?') && key.modifiers.is_empty() {
+                app.previous_mode = Some(app.mode.clone());
+                app.mode = AppMode::HelpOverlay;
+                return Ok(false);
             }
 
             if app.query_visible
@@ -1752,7 +2311,9 @@ fn handle_event(app: &mut App) -> Result<bool> {
 }
 
 fn handle_navigation_mode_key(app: &mut App, key: KeyEvent) -> bool {
-    if !key.modifiers.is_empty() {
+    // Allow Shift through for BackTab; reject all other modifier combos
+    let is_shift_only = key.modifiers == KeyModifiers::SHIFT;
+    if !key.modifiers.is_empty() && !(key.code == KeyCode::BackTab && is_shift_only) {
         return false;
     }
 
@@ -1770,6 +2331,10 @@ fn handle_navigation_mode_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('3') if is_navigation_surface => {
             app.focus_results_panel();
+            true
+        }
+        KeyCode::Char('\\') if is_navigation_surface => {
+            app.toggle_file_list();
             true
         }
         KeyCode::Tab if is_navigation_surface => {
@@ -1848,13 +2413,89 @@ fn handle_query_key(app: &mut App, key: KeyEvent) {
     } else if key.code == KeyCode::F(5) {
         app.execute_query();
     } else if app.edit_mode == EditMode::Navigate && key.modifiers.is_empty() {
-        match key.code {
-            KeyCode::Char('o') => app.open_query_file_picker(),
-            KeyCode::Char('n') => app.open_query_file_create(),
-            KeyCode::Char('r') => app.execute_query(),
-            _ => {
-                if let Some(input) = map_query_navigation_key(key) {
-                    app.query_editor.input(input);
+        if app.file_list_visible {
+            // File list navigation mode
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let new_sel = app
+                        .query_file_list_state
+                        .selected()
+                        .and_then(|sel| if sel > 0 { Some(sel - 1) } else { None });
+                    if let Some(sel) = new_sel {
+                        app.query_file_list_state.select(Some(sel));
+                        if let Some(path) = app.query_files.get(sel).cloned() {
+                            app.select_query_file(path);
+                        }
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let new_sel = app.query_file_list_state.selected().and_then(|sel| {
+                        if sel < app.query_files.len().saturating_sub(1) {
+                            Some(sel + 1)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(sel) = new_sel {
+                        app.query_file_list_state.select(Some(sel));
+                        if let Some(path) = app.query_files.get(sel).cloned() {
+                            app.select_query_file(path);
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(sel) = app.query_file_list_state.selected() {
+                        if let Some(path) = app.query_files.get(sel).cloned() {
+                            app.select_query_file(path);
+                        }
+                    }
+                }
+                KeyCode::Char('n') => app.open_query_file_create(),
+                KeyCode::Char('m') => app.start_rename_query_file(),
+                KeyCode::Delete => {
+                    if let Some(sel) = app.query_file_list_state.selected() {
+                        if let Some(path) = app.query_files.get(sel).cloned() {
+                            app.file_delete_target = Some(path);
+                            app.mode = AppMode::QueryFileDeleteConfirm;
+                        }
+                    }
+                }
+                KeyCode::Char('G') => {
+                    if !app.query_files.is_empty() {
+                        let last = app.query_files.len() - 1;
+                        app.query_file_list_state.select(Some(last));
+                        if let Some(path) = app.query_files.get(last).cloned() {
+                            app.select_query_file(path);
+                        }
+                    }
+                }
+                KeyCode::Char('g') => {
+                    if !app.query_files.is_empty() {
+                        app.query_file_list_state.select(Some(0));
+                        if let Some(path) = app.query_files.get(0).cloned() {
+                            app.select_query_file(path);
+                        }
+                    }
+                }
+                KeyCode::Char('r') => app.execute_query(),
+                KeyCode::Char('\\') => app.toggle_file_list(),
+                _ => {
+                    if let Some(input) = map_query_navigation_key(key) {
+                        app.query_editor.input(input);
+                    }
+                }
+            }
+        } else {
+            // Editor navigation mode (no file list visible)
+            match key.code {
+                KeyCode::Char('o') => app.open_query_file_picker(),
+                KeyCode::Char('n') => app.open_query_file_create(),
+                KeyCode::Char('r') => app.execute_query(),
+                KeyCode::Char('\\') => app.toggle_file_list(),
+                _ => {
+                    if let Some(input) = map_query_navigation_key(key) {
+                        app.query_editor.input(input);
+                    }
                 }
             }
         }
@@ -2004,14 +2645,20 @@ mod tests {
             focus: Focus::Command,
             edit_mode: EditMode::Navigate,
             mode: AppMode::Normal,
+            previous_mode: None,
             command_input: String::new(),
             query_editor: App::new_query_editor(Vec::new()),
             query_visible: false,
             needs_terminal_refresh: false,
             query_root_dir: PathBuf::from("."),
+            query_result_cache_dir: PathBuf::from(".marklogic-tui"),
             query_files: Vec::new(),
             active_query_file: None,
             query_file_list_state: ListState::default(),
+            file_list_visible: true,
+            file_delete_target: None,
+            rename_file_input: String::new(),
+            rename_file_target: None,
             new_query_file_input: String::new(),
             query_dirty: false,
             query_last_edit: None,
@@ -2044,8 +2691,23 @@ mod tests {
             server_list_state: ListState::default(),
             collection_list: Vec::new(),
             collection_list_state: ListState::default(),
+            fullscreen_area_height: 0,
+            last_fullscreen_g: None,
             rt: Runtime::new().unwrap(),
         }
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "marklogic-tui-main-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
     }
 
     #[test]
@@ -2243,16 +2905,12 @@ mod tests {
     fn modal_input_query_title_reflects_mode_specific_shortcuts() {
         let mut app = test_app();
         app.focus_query_panel();
-        assert!(
-            app.query_title()
-                .contains("i:insert mode|F4:editor|o:switch file|n:new|r/F5:run")
-        );
+        // query_title returns the file name with optional dirty marker
+        assert!(app.query_title().starts_with("Query: "));
 
-        app.edit_mode = EditMode::Insert;
-        assert!(
-            app.query_title()
-                .contains("ESC:Normal mode|Ctrl-r:Run|Ctrl-o:switch file")
-        );
+        app.active_query_file = Some(PathBuf::from("test.xqy"));
+        app.query_dirty = true;
+        assert_eq!(app.query_title(), "Query: test.xqy*");
     }
 
     #[test]
@@ -2320,6 +2978,76 @@ mod tests {
 
         assert_eq!(app.focus, Focus::Query);
         assert_eq!(app.query_results, vec!["result".to_string()]);
+    }
+
+    #[test]
+    fn query_file_switch_restores_cached_results_per_file() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("query-cache-switch");
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let query_one = temp_dir.join("query-1.xqy");
+        let query_two = temp_dir.join("query-2.xqy");
+        fs::write(&query_one, "xquery version \"1.0-ml\";").unwrap();
+        fs::write(&query_two, "xquery version \"1.0-ml\";").unwrap();
+
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        app.query_files = vec![query_one.clone(), query_two.clone()];
+        app.query_file_list_state.select(Some(0));
+
+        app.set_query_results(vec!["result-a".to_string()]);
+        app.persist_query_results_for_path(&query_one);
+
+        app.set_query_results(vec!["result-b1".to_string(), "result-b2".to_string()]);
+        app.query_results_state.select(Some(1));
+        app.persist_query_results_for_path(&query_two);
+
+        app.load_query_file(query_one.clone()).unwrap();
+        assert_eq!(app.query_results, vec!["result-a".to_string()]);
+        assert_eq!(app.query_results_state.selected(), Some(0));
+
+        app.load_query_file(query_two.clone()).unwrap();
+        assert_eq!(
+            app.query_results,
+            vec!["result-b1".to_string(), "result-b2".to_string()]
+        );
+        assert_eq!(app.query_results_state.selected(), Some(1));
+
+        app.load_query_file(query_one).unwrap();
+        assert_eq!(app.query_results, vec!["result-a".to_string()]);
+        assert_eq!(app.query_results_state.selected(), Some(0));
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn load_query_file_without_cached_results_clears_previous_query_results() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("query-cache-miss");
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let query_one = temp_dir.join("query-1.xqy");
+        let query_two = temp_dir.join("query-2.xqy");
+        fs::write(&query_one, "xquery version \"1.0-ml\";").unwrap();
+        fs::write(&query_two, "xquery version \"1.0-ml\";").unwrap();
+
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        app.query_files = vec![query_one.clone(), query_two.clone()];
+
+        app.set_query_results(vec!["cached-result".to_string()]);
+        app.persist_query_results_for_path(&query_one);
+
+        app.load_query_file(query_one).unwrap();
+        assert_eq!(app.query_results, vec!["cached-result".to_string()]);
+        assert_eq!(app.query_results_state.selected(), Some(0));
+
+        app.load_query_file(query_two).unwrap();
+        assert!(app.query_results.is_empty());
+        assert_eq!(app.query_results_state.selected(), None);
+
+        fs::remove_dir_all(temp_dir).unwrap();
     }
 
     #[test]
@@ -2444,6 +3172,20 @@ fn handle_command_key(app: &mut App, key: KeyEvent) {
                 app.open_filter_input();
                 return;
             }
+
+            if c == ':' {
+                if app.command_input == ":" {
+                    return;
+                }
+                if app.command_input.is_empty() {
+                    app.command_input.push(':');
+                    app.update_autocomplete();
+                    return;
+                }
+            } else if app.command_input.is_empty() {
+                app.command_input.push(':');
+            }
+
             app.command_input.push(c);
             app.update_autocomplete();
         }
@@ -2765,6 +3507,15 @@ fn handle_delete_confirm_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 }
 
 fn handle_fullscreen_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let half_page = app.fullscreen_area_height.saturating_sub(2) / 2;
+    let total_lines = app.full_view_content.lines().count() as u16;
+    let visible_lines = app.fullscreen_area_height.saturating_sub(2);
+    let max_scroll = total_lines.saturating_sub(visible_lines);
+
+    if key.code != KeyCode::Char('g') {
+        app.last_fullscreen_g = None;
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.mode = AppMode::Normal;
@@ -2773,16 +3524,35 @@ fn handle_fullscreen_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             app.open_document_in_external_editor();
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.full_view_scroll = app.full_view_scroll.saturating_add(1);
+            app.full_view_scroll = (app.full_view_scroll + 1).min(max_scroll);
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.full_view_scroll = app.full_view_scroll.saturating_sub(1);
         }
         KeyCode::PageDown | KeyCode::Char(' ') => {
-            app.full_view_scroll = app.full_view_scroll.saturating_add(20);
+            app.full_view_scroll = (app.full_view_scroll + 20).min(max_scroll);
         }
         KeyCode::PageUp => {
             app.full_view_scroll = app.full_view_scroll.saturating_sub(20);
+        }
+        KeyCode::Char('d') => {
+            app.full_view_scroll = (app.full_view_scroll + half_page.max(1)).min(max_scroll);
+        }
+        KeyCode::Char('u') => {
+            app.full_view_scroll = app.full_view_scroll.saturating_sub(half_page.max(1));
+        }
+        KeyCode::Char('G') => {
+            app.full_view_scroll = max_scroll;
+        }
+        KeyCode::Char('g') => {
+            if let Some(last_g) = app.last_fullscreen_g {
+                if last_g.elapsed().as_millis() < 500 {
+                    app.full_view_scroll = 0;
+                    app.last_fullscreen_g = None;
+                    return Ok(false);
+                }
+            }
+            app.last_fullscreen_g = Some(Instant::now());
         }
         _ => {}
     }
@@ -2886,6 +3656,43 @@ fn handle_server_add_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         }
         KeyCode::Char(c) => {
             app.server_add_fields[app.server_add_step].push(c);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_query_file_rename_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+            app.rename_file_target = None;
+        }
+        KeyCode::Enter => {
+            app.rename_query_file();
+        }
+        KeyCode::Backspace => {
+            app.rename_file_input.pop();
+        }
+        KeyCode::Char(c) => {
+            app.rename_file_input.push(c);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_query_file_delete_confirm_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            if let Some(path) = app.file_delete_target.take() {
+                app.delete_query_file(path);
+            }
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.file_delete_target = None;
+            app.mode = AppMode::Normal;
         }
         _ => {}
     }
