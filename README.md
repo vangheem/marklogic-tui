@@ -9,6 +9,7 @@ Browse documents, run JavaScript queries, manage collections, and interact with 
 - Browse and paginate documents across databases
 - Filter documents by collection or URI pattern
 - Edit and run query files from the launch directory
+- Track favorite and recent query folders
 - Execute JavaScript and XQuery files via MarkLogic's `/v1/eval` endpoint
 - View documents full-screen with pretty-printed JSON/XML and metadata
 - Delete documents (multi-select + confirm)
@@ -72,6 +73,9 @@ port = 8003
 
 > Note: Passwords are stored in plaintext in the config file.
 
+Tracked query folders are stored separately in `~/.marklogic-tui/folders.toml`.
+Per-folder cached query results remain in each query folder's own `.marklogic-tui/` directory.
+
 ## Commands
 
 Type `:` followed by a command and press `Enter`. Tab-completion is available.
@@ -89,6 +93,8 @@ Type `:` followed by a command and press `Enter`. Tab-completion is available.
 | `:query` | Show the active query file editor |
 | `:query-files` | Open the query file picker |
 | `:query-open` | Open the query file picker |
+| `:folders` | Open the tracked folder selector |
+| `:quit` | Quit the application |
 
 ## Keyboard Shortcuts
 
@@ -97,7 +103,7 @@ Type `:` followed by a command and press `Enter`. Tab-completion is available.
 | Key | Action |
 |---|---|
 | `Ctrl+C` | Quit |
-| `Esc` `Esc` (double, within 500ms) | Clear all filters and re-fetch |
+| `Esc` `Esc` (double, within 500ms) | Return to the centered start page |
 | `:` | Focus the command input |
 
 ### Results List
@@ -138,9 +144,10 @@ Type `:` followed by a command and press `Enter`. Tab-completion is available.
 | Key | Action |
 |---|---|
 | `Alt+Enter` / `Ctrl+Enter` / `F5` | Execute the query |
-| `Ctrl+E` | Open the current query-pane contents in `$EDITOR`, then load the saved edits back |
+| `e` | Open the current query-pane contents in `$EDITOR`, then load the saved edits back |
 | `Ctrl+S` | Save the active query file immediately |
 | `Ctrl+O` | Open the query file picker |
+| `f` (when Files list is focused) | Open the tracked folder selector |
 | `Esc` | Return focus to command input |
 
 Supported launch-directory file types: `.js`, `.mjs`, `.sjs`, `.xqy`, `.sql`, `.sparql`.
@@ -149,12 +156,24 @@ Supported launch-directory file types: `.js`, `.mjs`, `.sjs`, `.xqy`, `.sql`, `.
 - Phase 1 editing/switching only: `.sql`, `.sparql`
 - Editor changes autosave every 2 seconds after you stop typing
 
+### Tracked Folder Selector
+
+| Key | Action |
+|---|---|
+| `Enter` | Switch to selected folder |
+| `a` | Add a tracked folder by path |
+| `f` | Toggle favorite |
+| `d` | Remove tracked folder entry |
+| `c` | Clear that folder's cached query results |
+| `Esc` | Close popup |
+
 ### Full-Screen Document View
 
 | Key | Action |
 |---|---|
 | `Esc` / `q` | Close and return to results |
-| `Ctrl+E` | Edit the current document in `$EDITOR` and save it back to MarkLogic |
+| `e` | Edit the current document in `$EDITOR` and save it back to MarkLogic |
+| `?` | Show/hide keybindings help |
 | `j` / `Down` | Scroll down one line |
 | `k` / `Up` | Scroll up one line |
 | `Space` / `PageDown` | Scroll down 20 lines |
