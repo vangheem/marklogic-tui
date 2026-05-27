@@ -1,8 +1,9 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use digest_auth::AuthContext;
 use reqwest::{Client, Method, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -127,8 +128,7 @@ impl MarkLogicClient {
             .to_header_string();
 
         // Retry with digest auth
-        let req = configure(self.client.request(method, url))
-            .header("Authorization", auth_header);
+        let req = configure(self.client.request(method, url)).header("Authorization", auth_header);
         let resp = req.send().await?;
 
         if !resp.status().is_success() {
@@ -168,7 +168,7 @@ impl MarkLogicClient {
         let db = self.database.as_deref().unwrap_or("Documents").to_string();
         let script = "JSON.stringify(Array.from(cts.collections()))";
         let url = self.system_url("/v1/eval");
-        let body_str = format!("javascript={}", script);
+        let body_str = format!("javascript={}", urlencoding::encode(script));
         let db_clone = db.clone();
         let resp = self
             .request_with_digest(Method::POST, &url, |r| {
@@ -191,10 +191,13 @@ impl MarkLogicClient {
         let db_clone = db.clone();
         let resp = self
             .request_with_digest(Method::POST, &url, |r| {
-                r.header("Content-Type", "application/vnd.marklogic.querydsl+javascript")
-                    .header("Accept", "application/json")
-                    .query(&[("database", &db_clone)])
-                    .body(dsl_owned.clone())
+                r.header(
+                    "Content-Type",
+                    "application/vnd.marklogic.querydsl+javascript",
+                )
+                .header("Accept", "application/json")
+                .query(&[("database", &db_clone)])
+                .body(dsl_owned.clone())
             })
             .await
             .context("Failed to execute optic query")?;
@@ -206,7 +209,7 @@ impl MarkLogicClient {
     pub async fn js_query(&self, script: &str) -> Result<Vec<String>> {
         let db = self.database.as_deref().unwrap_or("Documents").to_string();
         let url = self.system_url("/v1/eval");
-        let body_str = format!("javascript={}", script);
+        let body_str = format!("javascript={}", urlencoding::encode(script));
         let db_clone = db.clone();
         let resp = self
             .request_with_digest(Method::POST, &url, |r| {
@@ -216,6 +219,24 @@ impl MarkLogicClient {
             })
             .await
             .context("Failed to execute JavaScript query")?;
+        let text = resp.text().await?;
+        parse_eval_response_parts(&text)
+    }
+
+    /// Execute an XQuery via eval endpoint, returning individual result parts
+    pub async fn xquery_query(&self, script: &str) -> Result<Vec<String>> {
+        let db = self.database.as_deref().unwrap_or("Documents").to_string();
+        let url = self.system_url("/v1/eval");
+        let body_str = format!("xquery={}", urlencoding::encode(script));
+        let db_clone = db.clone();
+        let resp = self
+            .request_with_digest(Method::POST, &url, |r| {
+                r.header("Content-Type", "application/x-www-form-urlencoded")
+                    .query(&[("database", db_clone.as_str())])
+                    .body(body_str.clone())
+            })
+            .await
+            .context("Failed to execute XQuery")?;
         let text = resp.text().await?;
         parse_eval_response_parts(&text)
     }
@@ -233,9 +254,9 @@ impl MarkLogicClient {
 
         // If URI filter is set, use eval with cts.uriMatch for flexible matching
         if let Some(filter) = uri_filter {
-            return self.search_documents_with_uri_filter(
-                collection, filter, start, page_size, &db,
-            ).await;
+            return self
+                .search_documents_with_uri_filter(collection, filter, start, page_size, &db)
+                .await;
         }
 
         let url = self.system_url("/v1/search");
@@ -273,7 +294,10 @@ impl MarkLogicClient {
                     .map(|item| {
                         let uri = item["uri"].as_str().unwrap_or("").to_string();
                         // Collections aren't returned in default search; will be fetched on detail view
-                        SearchResult { uri, collections: Vec::new() }
+                        SearchResult {
+                            uri,
+                            collections: Vec::new(),
+                        }
                     })
                     .collect()
             })
@@ -281,9 +305,9 @@ impl MarkLogicClient {
 
         // Fetch collections for the returned URIs
         if !results.is_empty() {
-            let uris_json = serde_json::to_string(
-                &results.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>()
-            ).unwrap();
+            let uris_json =
+                serde_json::to_string(&results.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>())
+                    .unwrap();
             let script = format!(
                 r#"
                 const uris = {};
@@ -295,7 +319,7 @@ impl MarkLogicClient {
                 uris_json
             );
             let eval_url = self.system_url("/v1/eval");
-            let body_str = format!("javascript={}", script);
+            let body_str = format!("javascript={}", urlencoding::encode(&script));
             let db_clone2 = db.clone();
             if let Ok(resp) = self
                 .request_with_digest(Method::POST, &eval_url, |r| {
@@ -315,7 +339,11 @@ impl MarkLogicClient {
                                     let uri = item["uri"].as_str().unwrap_or("");
                                     let cols: Vec<String> = item["collections"]
                                         .as_array()
-                                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|v| v.as_str().map(String::from))
+                                                .collect()
+                                        })
                                         .unwrap_or_default();
                                     if let Some(r) = results.iter_mut().find(|r| r.uri == uri) {
                                         r.collections = cols;
@@ -398,7 +426,11 @@ impl MarkLogicClient {
                         let uri = item["uri"].as_str().unwrap_or("").to_string();
                         let collections: Vec<String> = item["collections"]
                             .as_array()
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         results.push(SearchResult { uri, collections });
                     }
@@ -425,10 +457,7 @@ impl MarkLogicClient {
         // Get content
         let resp = self
             .request_with_digest(Method::GET, &url, |r| {
-                r.query(&[
-                    ("database", db_clone.as_str()),
-                    ("uri", uri_owned.as_str()),
-                ])
+                r.query(&[("database", db_clone.as_str()), ("uri", uri_owned.as_str())])
             })
             .await
             .context("Failed to get document")?;
@@ -452,7 +481,11 @@ impl MarkLogicClient {
 
         let collections = meta_body["collections"]
             .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let quality = meta_body["quality"].as_i64();
         let permissions = meta_body["permissions"]
@@ -489,6 +522,25 @@ impl MarkLogicClient {
         })
     }
 
+    /// Replace a single document's content by URI.
+    pub async fn update_document(&self, uri: &str, content: &str) -> Result<()> {
+        let db = self.database.as_deref().unwrap_or("Documents").to_string();
+        let url = self.system_url("/v1/documents");
+        let uri_owned = uri.to_string();
+        let db_clone = db.clone();
+        let content_type = infer_document_content_type(uri, content);
+
+        self.request_with_digest(Method::PUT, &url, |r| {
+            r.query(&[("database", db_clone.as_str()), ("uri", uri_owned.as_str())])
+                .header("Content-Type", content_type)
+                .body(content.to_string())
+        })
+        .await
+        .with_context(|| format!("Failed to update document: {}", uri))?;
+
+        Ok(())
+    }
+
     /// Delete documents by URIs
     pub async fn delete_documents(&self, uris: &[String]) -> Result<()> {
         if uris.is_empty() {
@@ -502,10 +554,7 @@ impl MarkLogicClient {
             let db_clone = db.clone();
             let uri_clone = uri.clone();
             self.request_with_digest(Method::DELETE, &url, |r| {
-                r.query(&[
-                    ("database", db_clone.as_str()),
-                    ("uri", uri_clone.as_str()),
-                ])
+                r.query(&[("database", db_clone.as_str()), ("uri", uri_clone.as_str())])
             })
             .await
             .with_context(|| format!("Failed to delete document: {}", uri))?;
@@ -614,9 +663,31 @@ fn parse_eval_response_parts(text: &str) -> Result<Vec<String>> {
     Ok(formatted)
 }
 
+fn infer_document_content_type(uri: &str, content: &str) -> &'static str {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return "application/json";
+    }
+    if trimmed.starts_with('<') {
+        return "application/xml";
+    }
+
+    match Path::new(uri)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("json") => "application/json",
+        Some("xml" | "xhtml" | "svg") => "application/xml",
+        _ => "text/plain",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn test_client() -> MarkLogicClient {
         let server = ServerConfig {
@@ -639,7 +710,8 @@ mod tests {
                 assert!(!dbs.is_empty(), "Should have at least one database");
                 // MarkLogic always has these system databases
                 assert!(
-                    dbs.iter().any(|d| d == "Documents" || d == "Security" || d == "Schemas"),
+                    dbs.iter()
+                        .any(|d| d == "Documents" || d == "Security" || d == "Schemas"),
                     "Should contain system databases, got: {:?}",
                     dbs
                 );
@@ -658,7 +730,10 @@ mod tests {
         match result {
             Ok(cols) => {
                 println!("Collections: {:?}", cols);
-                assert!(!cols.is_empty(), "Should have collections in data-platform-content");
+                assert!(
+                    !cols.is_empty(),
+                    "Should have collections in data-platform-content"
+                );
             }
             Err(e) => {
                 panic!("Failed to list collections: {}", e);
@@ -696,7 +771,10 @@ mod tests {
         let mut client = test_client();
         client.set_database("data-platform-content".to_string());
         // First get a URI
-        let paged = client.search_documents(None, None, None, 1, 1).await.unwrap();
+        let paged = client
+            .search_documents(None, None, None, 1, 1)
+            .await
+            .unwrap();
         let uri = &paged.results[0].uri;
         println!("Testing collections for URI: {}", uri);
 
@@ -776,7 +854,10 @@ mod tests {
                 );
                 for r in &paged.results {
                     println!("  URI: {} | Collections: {:?}", r.uri, r.collections);
-                    assert!(r.uri.contains("/activity/"), "URI should contain /activity/");
+                    assert!(
+                        r.uri.contains("/activity/"),
+                        "URI should contain /activity/"
+                    );
                 }
                 assert!(
                     !paged.results.is_empty(),
@@ -787,5 +868,39 @@ mod tests {
                 panic!("Failed to search with URI filter: {}", e);
             }
         }
+    }
+
+    #[test]
+    fn infer_document_content_type_uses_content_before_extension() {
+        assert_eq!(
+            infer_document_content_type("/example.txt", r#"{"ok":true}"#),
+            "application/json"
+        );
+        assert_eq!(
+            infer_document_content_type("/example.txt", "<root/>"),
+            "application/xml"
+        );
+    }
+
+    #[test]
+    fn infer_document_content_type_falls_back_to_uri_extension() {
+        assert_eq!(
+            infer_document_content_type("/example.json", "not-json"),
+            "application/json"
+        );
+        assert_eq!(
+            infer_document_content_type("/example.xml", "not-xml"),
+            "application/xml"
+        );
+        assert_eq!(
+            infer_document_content_type("/example.txt", "plain text"),
+            "text/plain"
+        );
+        assert_eq!(
+            Path::new("/example.txt")
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some("txt")
+        );
     }
 }

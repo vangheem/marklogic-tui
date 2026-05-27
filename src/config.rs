@@ -47,9 +47,7 @@ impl AppConfig {
 
     pub fn add_server(&mut self, server: ServerConfig) {
         self.servers.retain(|s| s.name != server.name);
-        if self.active_server.is_none() {
-            self.active_server = Some(server.name.clone());
-        }
+        self.active_server = Some(server.name.clone());
         self.servers.push(server);
     }
 
@@ -58,5 +56,50 @@ impl AppConfig {
         if self.active_server.as_deref() == Some(name) {
             self.active_server = self.servers.first().map(|s| s.name.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+    use crate::client::ServerConfig;
+
+    fn server(name: &str, uri: &str) -> ServerConfig {
+        ServerConfig {
+            name: name.to_string(),
+            uri: uri.to_string(),
+            username: "admin".to_string(),
+            password: "admin".to_string(),
+            port: 8003,
+        }
+    }
+
+    #[test]
+    fn add_server_makes_new_server_active() {
+        let mut config = AppConfig {
+            servers: vec![server("old", "http://old.example")],
+            active_server: Some("old".to_string()),
+            active_database: Some("Documents".to_string()),
+        };
+
+        config.add_server(server("new", "http://new.example"));
+
+        assert_eq!(config.active_server.as_deref(), Some("new"));
+        assert_eq!(config.servers.len(), 2);
+    }
+
+    #[test]
+    fn replacing_server_keeps_replacement_active() {
+        let mut config = AppConfig {
+            servers: vec![server("local", "http://old.example")],
+            active_server: Some("local".to_string()),
+            active_database: None,
+        };
+
+        config.add_server(server("local", "http://new.example"));
+
+        assert_eq!(config.active_server.as_deref(), Some("local"));
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].uri, "http://new.example");
     }
 }
