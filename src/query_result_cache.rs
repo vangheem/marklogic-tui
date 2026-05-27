@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 const SNAPSHOT_FILE_NAME: &str = "results-v1.json";
 
@@ -9,6 +10,8 @@ const SNAPSHOT_FILE_NAME: &str = "results-v1.json";
 pub struct QueryResultSnapshot {
     pub query_results: Vec<String>,
     pub selected_index: Option<usize>,
+    #[serde(default)]
+    pub created_at: Option<u64>,
 }
 
 pub fn load_query_result_snapshot(
@@ -23,8 +26,15 @@ pub fn load_query_result_snapshot(
 
     let contents = fs::read_to_string(&snapshot_path)
         .with_context(|| format!("Failed to read result cache: {}", snapshot_path.display()))?;
-    let snapshot = serde_json::from_str(&contents)
+    let mut snapshot: QueryResultSnapshot = serde_json::from_str(&contents)
         .with_context(|| format!("Failed to parse result cache: {}", snapshot_path.display()))?;
+    if snapshot.created_at.is_none() {
+        snapshot.created_at = fs::metadata(&snapshot_path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs());
+    }
     Ok(Some(snapshot))
 }
 
@@ -171,6 +181,7 @@ mod tests {
         QueryResultSnapshot {
             query_results: vec!["one".to_string(), "two".to_string()],
             selected_index: Some(1),
+            created_at: Some(1),
         }
     }
 
@@ -208,6 +219,31 @@ mod tests {
 
         let loaded = load_query_result_snapshot(&cache_dir, &root_dir, &query_path).unwrap();
         assert!(loaded.is_none());
+
+        fs::remove_dir_all(root_dir).unwrap();
+    }
+
+    #[test]
+    fn load_snapshot_without_created_at_uses_file_mtime() {
+        let root_dir = temp_test_dir("missing-created-at");
+        fs::create_dir_all(&root_dir).unwrap();
+
+        let query_path = root_dir.join("query-1.xqy");
+        fs::write(&query_path, "xquery version \"1.0-ml\";").unwrap();
+        let cache_dir = root_dir.join(".marklogic-tui");
+        let snapshot_dir = cache_dir.join("query-1.xqy");
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        let snapshot_path = snapshot_dir.join(SNAPSHOT_FILE_NAME);
+        fs::write(
+            &snapshot_path,
+            "{\n  \"query_results\": [\"one\"],\n  \"selected_index\": 0\n}",
+        )
+        .unwrap();
+
+        let loaded = load_query_result_snapshot(&cache_dir, &root_dir, &query_path)
+            .unwrap()
+            .unwrap();
+        assert!(loaded.created_at.is_some());
 
         fs::remove_dir_all(root_dir).unwrap();
     }

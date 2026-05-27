@@ -2,6 +2,7 @@ mod client;
 mod config;
 mod query_file;
 mod query_result_cache;
+mod tracked_folder;
 
 use anyhow::{Context, Result, bail};
 use client::{MarkLogicClient, SearchResult, ServerConfig};
@@ -40,6 +41,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
+use tracked_folder::{TrackedFolderEntry, TrackedFolderStore, canonicalize_folder};
 use tui_textarea::{Input, TextArea};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +60,7 @@ enum EditMode {
 
 #[derive(Debug, Clone, PartialEq)]
 enum AppMode {
+    StartPage,
     Normal,
     FullScreenView,
     ServerAdd,
@@ -69,7 +72,17 @@ enum AppMode {
     QueryFileCreate,
     QueryFileRename,
     QueryFileDeleteConfirm,
+    TrackedFolderSelect,
+    TrackedFolderAdd,
+    TrackedFolderDeleteConfirm,
+    TrackedFolderCacheClearConfirm,
     HelpOverlay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrackedFolderMenuItem {
+    Header(&'static str),
+    Folder(TrackedFolderEntry),
 }
 
 struct App {
@@ -79,15 +92,23 @@ struct App {
     edit_mode: EditMode,
     mode: AppMode,
     previous_mode: Option<AppMode>,
+    modal_origin_focus: Option<Focus>,
     command_input: String,
     query_editor: TextArea<'static>,
     query_visible: bool,
     needs_terminal_refresh: bool,
+    should_quit: bool,
     query_root_dir: PathBuf,
     query_result_cache_dir: PathBuf,
     query_files: Vec<PathBuf>,
     active_query_file: Option<PathBuf>,
     query_file_list_state: ListState,
+    tracked_folders: TrackedFolderStore,
+    tracked_folder_items: Vec<TrackedFolderMenuItem>,
+    tracked_folder_list_state: ListState,
+    tracked_folder_input: String,
+    tracked_folder_delete_target: Option<PathBuf>,
+    tracked_folder_cache_clear_target: Option<PathBuf>,
     file_list_visible: bool,
     file_delete_target: Option<PathBuf>,
     rename_file_input: String,
@@ -100,6 +121,7 @@ struct App {
     status_message: String,
     // Query results (individual parts from eval)
     query_results: Vec<String>,
+    query_results_timestamp: Option<SystemTime>,
     query_results_state: TableState,
     // Listing state
     records: Vec<SearchResult>,
@@ -142,7 +164,11 @@ impl App {
     fn new() -> Result<Self> {
         let config = AppConfig::load()?;
         let rt = Runtime::new()?;
-        let query_root_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut tracked_folders = TrackedFolderStore::load()?;
+        let query_root_dir =
+            canonicalize_folder(&env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))?;
+        tracked_folders.record_access(&query_root_dir)?;
+        tracked_folders.save()?;
         let query_result_cache_dir = query_root_dir.join(".marklogic-tui");
         let query_files = discover_query_files(&query_root_dir)?;
         let active_query_file = query_files.first().cloned();
@@ -159,17 +185,25 @@ impl App {
             client,
             focus: Focus::Command,
             edit_mode: EditMode::Navigate,
-            mode: AppMode::Normal,
+            mode: AppMode::StartPage,
             previous_mode: None,
+            modal_origin_focus: None,
             command_input: String::new(),
             query_editor: Self::new_query_editor(Vec::new()),
             query_visible: false,
             needs_terminal_refresh: false,
+            should_quit: false,
             query_root_dir,
             query_result_cache_dir,
             query_files,
             active_query_file,
             query_file_list_state: ListState::default(),
+            tracked_folders,
+            tracked_folder_items: Vec::new(),
+            tracked_folder_list_state: ListState::default(),
+            tracked_folder_input: String::new(),
+            tracked_folder_delete_target: None,
+            tracked_folder_cache_clear_target: None,
             file_list_visible: true,
             file_delete_target: None,
             rename_file_input: String::new(),
@@ -181,6 +215,7 @@ impl App {
             results_text: String::new(),
             status_message: String::new(),
             query_results: Vec::new(),
+            query_results_timestamp: None,
             query_results_state: TableState::default(),
             records: Vec::new(),
             list_state: TableState::default(),
@@ -213,6 +248,7 @@ impl App {
 
         if let Ok(ref mut app) = app_result {
             app.initialize_query_editor();
+            app.rebuild_tracked_folder_items();
         }
 
         // Calculate initial page_size from terminal size
@@ -220,11 +256,9 @@ impl App {
             app.recalculate_page_size();
         }
 
-        // Auto-list if server and database are configured
+        // Start in the centered command-first home screen.
         if let Ok(ref mut app) = app_result {
-            if app.client.is_some() && app.config.active_database.is_some() {
-                app.fetch_list();
-            }
+            app.enter_start_page();
         }
 
         app_result
@@ -242,6 +276,8 @@ impl App {
         (":query", "Show the active query file"),
         (":query-files", "Open the query file picker"),
         (":query-open", "Open the query file picker"),
+        (":folders", "Open the tracked folder selector"),
+        (":quit", "Quit the application"),
     ];
 
     fn new_query_editor(lines: Vec<String>) -> TextArea<'static> {
@@ -251,7 +287,7 @@ impl App {
             lines
         });
         ta.set_block(Block::default().borders(Borders::ALL).title(
-            "Query [Alt+Enter or F5 to run, Ctrl+E to edit, Ctrl+S to save, Ctrl+O to switch]",
+            "Query [Alt+Enter or F5 to run, e to edit, Ctrl+S to save, Ctrl+O to switch]",
         ));
         ta
     }
@@ -313,6 +349,286 @@ impl App {
         Ok(())
     }
 
+    fn rebuild_tracked_folder_items(&mut self) {
+        let preferred_selection = self
+            .selected_tracked_folder_path()
+            .unwrap_or_else(|| self.query_root_dir.clone());
+        let mut items = Vec::new();
+
+        let favorites = self.tracked_folders.favorite_entries();
+        if !favorites.is_empty() {
+            items.push(TrackedFolderMenuItem::Header("Favorites"));
+            items.extend(favorites.into_iter().map(TrackedFolderMenuItem::Folder));
+        }
+
+        let recents = self.tracked_folders.recent_entries();
+        if !recents.is_empty() {
+            items.push(TrackedFolderMenuItem::Header("Recent"));
+            items.extend(recents.into_iter().map(TrackedFolderMenuItem::Folder));
+        }
+
+        self.tracked_folder_items = items;
+        let selected = self
+            .tracked_folder_item_index(&preferred_selection)
+            .or_else(|| self.first_tracked_folder_item_index());
+        self.tracked_folder_list_state.select(selected);
+    }
+
+    fn first_tracked_folder_item_index(&self) -> Option<usize> {
+        self.tracked_folder_items
+            .iter()
+            .position(|item| matches!(item, TrackedFolderMenuItem::Folder(_)))
+    }
+
+    fn last_tracked_folder_item_index(&self) -> Option<usize> {
+        self.tracked_folder_items
+            .iter()
+            .rposition(|item| matches!(item, TrackedFolderMenuItem::Folder(_)))
+    }
+
+    fn tracked_folder_item_index(&self, path: &Path) -> Option<usize> {
+        let path_string = path.to_string_lossy().to_string();
+        self.tracked_folder_items.iter().position(|item| {
+            matches!(item, TrackedFolderMenuItem::Folder(entry) if entry.path == path_string)
+        })
+    }
+
+    fn selected_tracked_folder_path(&self) -> Option<PathBuf> {
+        let selected = self.tracked_folder_list_state.selected()?;
+        match self.tracked_folder_items.get(selected)? {
+            TrackedFolderMenuItem::Folder(entry) => Some(PathBuf::from(&entry.path)),
+            TrackedFolderMenuItem::Header(_) => None,
+        }
+    }
+
+    fn move_tracked_folder_selection(&mut self, delta: isize) {
+        if self.tracked_folder_items.is_empty() {
+            self.tracked_folder_list_state.select(None);
+            return;
+        }
+
+        let len = self.tracked_folder_items.len() as isize;
+        let start = self
+            .tracked_folder_list_state
+            .selected()
+            .map(|idx| idx as isize);
+        let mut index = start.unwrap_or(if delta >= 0 { -1 } else { len });
+
+        loop {
+            index += delta;
+            if index < 0 || index >= len {
+                break;
+            }
+            if matches!(
+                self.tracked_folder_items.get(index as usize),
+                Some(TrackedFolderMenuItem::Folder(_))
+            ) {
+                self.tracked_folder_list_state.select(Some(index as usize));
+                return;
+            }
+        }
+    }
+
+    fn open_tracked_folder_picker(&mut self) {
+        self.rebuild_tracked_folder_items();
+        if let Some(index) = self.tracked_folder_item_index(&self.query_root_dir) {
+            self.tracked_folder_list_state.select(Some(index));
+        }
+        self.open_modal(AppMode::TrackedFolderSelect);
+    }
+
+    fn open_tracked_folder_add(&mut self) {
+        self.tracked_folder_input.clear();
+        self.open_modal(AppMode::TrackedFolderAdd);
+    }
+
+    fn add_tracked_folder_from_input(&mut self) {
+        let input = self.tracked_folder_input.trim().to_string();
+        if input.is_empty() {
+            self.status_message = "Enter a folder path.".to_string();
+            return;
+        }
+
+        let candidate = resolve_folder_input(&self.query_root_dir, &input);
+        match self.tracked_folders.add_folder(&candidate) {
+            Ok(path) => {
+                if let Err(e) = self.switch_query_root(path) {
+                    self.status_message = format!("Failed to switch folder: {}", e);
+                    self.mode = AppMode::TrackedFolderAdd;
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to add folder: {}", e);
+            }
+        }
+    }
+
+    fn switch_query_root(&mut self, path: PathBuf) -> Result<()> {
+        let canonical_root = canonicalize_folder(&path)?;
+
+        if canonical_root == self.query_root_dir {
+            self.tracked_folders.record_access(&canonical_root)?;
+            self.tracked_folders.save()?;
+            self.rebuild_tracked_folder_items();
+            self.close_modal_with_focus(Focus::Query);
+            self.status_message = format!(
+                "Folder already active: {}",
+                display_folder_path(&canonical_root)
+            );
+            return Ok(());
+        }
+
+        self.save_query_file_if_dirty()?;
+
+        self.query_root_dir = canonical_root.clone();
+        self.query_result_cache_dir = canonical_root.join(".marklogic-tui");
+        self.active_query_file = None;
+        self.query_dirty = false;
+        self.query_last_edit = None;
+
+        self.tracked_folders.record_access(&canonical_root)?;
+        self.tracked_folders.save()?;
+
+        self.refresh_query_files()?;
+
+        if let Some(path) = self.query_files.first().cloned() {
+            self.load_query_file(path)?;
+            self.status_message = format!(
+                "Switched query folder: {}",
+                display_folder_path(&canonical_root)
+            );
+        } else {
+            self.query_editor = Self::new_query_editor(Vec::new());
+            self.active_query_file = None;
+            self.clear_query_results_view();
+            self.focus_query_panel();
+            self.status_message = format!(
+                "Switched query folder: {} (no supported query files found)",
+                display_folder_path(&canonical_root)
+            );
+        }
+
+        self.rebuild_tracked_folder_items();
+        self.close_modal_with_focus(Focus::Query);
+        Ok(())
+    }
+
+    fn switch_to_selected_tracked_folder(&mut self) {
+        let Some(path) = self.selected_tracked_folder_path() else {
+            self.status_message = "No folder selected.".to_string();
+            return;
+        };
+
+        if let Err(e) = self.switch_query_root(path) {
+            self.status_message = format!("Failed to switch folder: {}", e);
+            self.mode = AppMode::TrackedFolderSelect;
+        }
+    }
+
+    fn toggle_selected_tracked_folder_favorite(&mut self) {
+        let Some(path) = self.selected_tracked_folder_path() else {
+            self.status_message = "No folder selected.".to_string();
+            return;
+        };
+
+        let Some(is_favorite) = self.tracked_folders.toggle_favorite(&path) else {
+            self.status_message = "No folder selected.".to_string();
+            return;
+        };
+
+        match self.tracked_folders.save() {
+            Ok(()) => {
+                self.rebuild_tracked_folder_items();
+                self.status_message = if is_favorite {
+                    format!("Added favorite folder: {}", display_folder_path(&path))
+                } else {
+                    format!("Removed favorite folder: {}", display_folder_path(&path))
+                };
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to update favorite folder: {}", e);
+            }
+        }
+    }
+
+    fn start_delete_selected_tracked_folder(&mut self) {
+        self.tracked_folder_delete_target = self.selected_tracked_folder_path();
+        if self.tracked_folder_delete_target.is_some() {
+            self.mode = AppMode::TrackedFolderDeleteConfirm;
+        } else {
+            self.status_message = "No folder selected.".to_string();
+        }
+    }
+
+    fn confirm_delete_selected_tracked_folder(&mut self) {
+        let Some(path) = self.tracked_folder_delete_target.take() else {
+            self.mode = AppMode::TrackedFolderSelect;
+            return;
+        };
+
+        if !self.tracked_folders.remove_folder(&path) {
+            self.status_message =
+                format!("Tracked folder not found: {}", display_folder_path(&path));
+            self.mode = AppMode::TrackedFolderSelect;
+            return;
+        }
+
+        match self.tracked_folders.save() {
+            Ok(()) => {
+                self.rebuild_tracked_folder_items();
+                self.status_message = if path == self.query_root_dir {
+                    format!(
+                        "Removed tracked folder: {} (current folder stays active)",
+                        display_folder_path(&path)
+                    )
+                } else {
+                    format!("Removed tracked folder: {}", display_folder_path(&path))
+                };
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to remove tracked folder: {}", e);
+            }
+        }
+
+        self.mode = AppMode::TrackedFolderSelect;
+    }
+
+    fn start_clear_selected_tracked_folder_cache(&mut self) {
+        self.tracked_folder_cache_clear_target = self.selected_tracked_folder_path();
+        if self.tracked_folder_cache_clear_target.is_some() {
+            self.mode = AppMode::TrackedFolderCacheClearConfirm;
+        } else {
+            self.status_message = "No folder selected.".to_string();
+        }
+    }
+
+    fn confirm_clear_selected_tracked_folder_cache(&mut self) {
+        let Some(path) = self.tracked_folder_cache_clear_target.take() else {
+            self.mode = AppMode::TrackedFolderSelect;
+            return;
+        };
+
+        let cache_dir = path.join(".marklogic-tui");
+        if !cache_dir.exists() {
+            self.status_message =
+                format!("No cached results found for {}", display_folder_path(&path));
+            self.mode = AppMode::TrackedFolderSelect;
+            return;
+        }
+
+        match fs::remove_dir_all(&cache_dir) {
+            Ok(()) => {
+                self.status_message =
+                    format!("Cleared cached results for {}", display_folder_path(&path));
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to clear cached results: {}", e);
+            }
+        }
+
+        self.mode = AppMode::TrackedFolderSelect;
+    }
+
     fn active_query_file_label(&self) -> String {
         self.active_query_file
             .as_ref()
@@ -332,9 +648,120 @@ impl App {
         }
     }
 
+    fn edit_mode_style(&self) -> Style {
+        match self.edit_mode {
+            EditMode::Navigate => Style::default().fg(Color::White),
+            EditMode::Insert => Style::default().fg(Color::White).bg(Color::Red),
+        }
+    }
+
+    fn start_page_mode_style(&self) -> Style {
+        Style::default()
+            .fg(self.edit_mode_accent_color())
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn edit_mode_accent_color(&self) -> Color {
+        match self.edit_mode {
+            EditMode::Navigate => Color::Cyan,
+            EditMode::Insert => Color::Red,
+        }
+    }
+
+    fn status_identity_spans(&self) -> Vec<Span<'static>> {
+        let server = self
+            .config
+            .active_server
+            .as_deref()
+            .unwrap_or("(no server)");
+        let db = self
+            .config
+            .active_database
+            .as_deref()
+            .unwrap_or("(no database)");
+
+        let gray = Style::default().fg(Color::DarkGray);
+
+        vec![
+            Span::styled(" · ", gray),
+            Span::styled(server.to_string(), gray),
+            Span::styled(" · ", gray),
+            Span::styled(db.to_string(), gray),
+        ]
+    }
+
     fn focus_command_panel(&mut self) {
         self.focus = Focus::Command;
         self.edit_mode = EditMode::Navigate;
+    }
+
+    fn apply_focus(&mut self, focus: Focus) {
+        match focus {
+            Focus::Command => self.focus_command_panel(),
+            Focus::Query => self.focus_query_panel(),
+            Focus::Results => self.focus_results_panel(),
+            Focus::Filter => {
+                self.focus = Focus::Filter;
+                self.edit_mode = EditMode::Navigate;
+            }
+        }
+    }
+
+    fn is_modal_mode(mode: &AppMode) -> bool {
+        matches!(
+            mode,
+            AppMode::ServerAdd
+                | AppMode::DatabaseSelect
+                | AppMode::ServerSelect
+                | AppMode::CollectionSelect
+                | AppMode::DeleteConfirm
+                | AppMode::QueryFileSelect
+                | AppMode::QueryFileCreate
+                | AppMode::QueryFileRename
+                | AppMode::QueryFileDeleteConfirm
+                | AppMode::TrackedFolderSelect
+                | AppMode::TrackedFolderAdd
+                | AppMode::TrackedFolderDeleteConfirm
+                | AppMode::TrackedFolderCacheClearConfirm
+        )
+    }
+
+    fn open_modal(&mut self, mode: AppMode) {
+        if !Self::is_modal_mode(&mode) {
+            self.mode = mode;
+            return;
+        }
+
+        if !Self::is_modal_mode(&self.mode) {
+            self.modal_origin_focus = Some(self.focus.clone());
+        }
+
+        self.mode = mode;
+    }
+
+    fn close_modal_restore_focus(&mut self) {
+        let target_focus = self
+            .modal_origin_focus
+            .take()
+            .unwrap_or_else(|| self.focus.clone());
+        self.mode = AppMode::Normal;
+        self.apply_focus(target_focus);
+    }
+
+    fn close_modal_with_focus(&mut self, focus: Focus) {
+        self.modal_origin_focus = None;
+        self.mode = AppMode::Normal;
+        self.apply_focus(focus);
+    }
+
+    fn enter_start_page(&mut self) {
+        self.mode = AppMode::StartPage;
+        self.modal_origin_focus = None;
+        self.focus_command_panel();
+        self.query_visible = false;
+        self.autocomplete_suggestions.clear();
+        self.autocomplete_selected = 0;
+        self.command_input.clear();
     }
 
     fn focus_query_panel(&mut self) {
@@ -364,14 +791,14 @@ impl App {
         match self.focus {
             Focus::Command | Focus::Filter => self.focus_query_panel(),
             Focus::Query => self.focus_results_panel(),
-            Focus::Results => self.focus_command_panel(),
+            Focus::Results => self.focus_query_panel(),
         }
     }
 
     fn cycle_panel_focus_backward(&mut self) {
         match self.focus {
             Focus::Command | Focus::Filter => self.focus_results_panel(),
-            Focus::Query => self.focus_command_panel(),
+            Focus::Query => self.focus_results_panel(),
             Focus::Results => self.focus_query_panel(),
         }
     }
@@ -470,7 +897,7 @@ impl App {
 
     fn open_query_file_create(&mut self) {
         self.new_query_file_input = self.default_new_query_file_name();
-        self.mode = AppMode::QueryFileCreate;
+        self.open_modal(AppMode::QueryFileCreate);
     }
 
     fn create_new_query_file_from_input(&mut self) {
@@ -513,7 +940,7 @@ impl App {
                     self.status_message = format!("Created file but failed to open it: {}", e);
                     return;
                 }
-                self.mode = AppMode::Normal;
+                self.close_modal_with_focus(Focus::Query);
                 self.status_message = format!(
                     "Created query file: {}",
                     display_query_path(&path, &self.query_root_dir)
@@ -561,20 +988,20 @@ impl App {
                 let name = display_query_path(&path, &self.query_root_dir);
                 self.rename_file_input = name;
                 self.rename_file_target = Some(path);
-                self.mode = AppMode::QueryFileRename;
+                self.open_modal(AppMode::QueryFileRename);
             }
         }
     }
 
     fn rename_query_file(&mut self) {
         let Some(old_path) = self.rename_file_target.take() else {
-            self.mode = AppMode::Normal;
+            self.close_modal_with_focus(Focus::Query);
             return;
         };
         let new_name = self.rename_file_input.trim().to_string();
         if new_name.is_empty() {
             self.status_message = "Enter a file name.".to_string();
-            self.mode = AppMode::Normal;
+            self.close_modal_with_focus(Focus::Query);
             return;
         }
 
@@ -582,7 +1009,7 @@ impl App {
         if file_path.components().count() != 1 {
             self.status_message =
                 "Enter a file name only, not a nested or absolute path.".to_string();
-            self.mode = AppMode::Normal;
+            self.close_modal_with_focus(Focus::Query);
             return;
         }
 
@@ -592,13 +1019,13 @@ impl App {
                 "File already exists: {}",
                 display_query_path(&new_path, &self.query_root_dir)
             );
-            self.mode = AppMode::Normal;
+            self.close_modal_with_focus(Focus::Query);
             return;
         }
 
         if let Err(e) = fs::rename(&old_path, &new_path) {
             self.status_message = format!("Failed to rename file: {}", e);
-            self.mode = AppMode::Normal;
+            self.close_modal_with_focus(Focus::Query);
             return;
         }
 
@@ -627,7 +1054,7 @@ impl App {
                     .push_str(&format!(" (cache move warning: {})", warning));
             }
         }
-        self.mode = AppMode::Normal;
+        self.close_modal_with_focus(Focus::Query);
     }
 
     fn set_query_results(&mut self, results: Vec<String>) {
@@ -636,6 +1063,7 @@ impl App {
         self.selected_indices.clear();
         self.total_results = None;
         self.query_results = results;
+        self.query_results_timestamp = Some(SystemTime::now());
         self.query_results_state
             .select(if self.query_results.is_empty() {
                 None
@@ -644,7 +1072,6 @@ impl App {
             });
         self.last_query_results_g = None;
         self.results_text.clear();
-        self.status_message = "Query executed".to_string();
     }
 
     fn clear_query_results_view(&mut self) {
@@ -653,6 +1080,7 @@ impl App {
         self.selected_indices.clear();
         self.total_results = None;
         self.query_results.clear();
+        self.query_results_timestamp = None;
         self.query_results_state.select(None);
         self.last_query_results_g = None;
         self.results_text.clear();
@@ -662,6 +1090,9 @@ impl App {
         let snapshot = QueryResultSnapshot {
             query_results: self.query_results.clone(),
             selected_index: self.query_results_state.selected(),
+            created_at: self
+                .query_results_timestamp
+                .map(|ts| ts.duration_since(UNIX_EPOCH).unwrap().as_secs()),
         };
 
         if let Err(e) = save_query_result_snapshot(
@@ -684,6 +1115,9 @@ impl App {
             self.selected_indices.clear();
             self.total_results = None;
             self.query_results = snapshot.query_results;
+            self.query_results_timestamp = snapshot
+                .created_at
+                .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
             let selected = snapshot
                 .selected_index
                 .filter(|idx| *idx < self.query_results.len())
@@ -712,49 +1146,66 @@ impl App {
     }
 
     fn open_document_in_external_editor(&mut self) {
-        let Some(detail) = self.active_document.clone() else {
-            self.status_message =
-                "The current full-screen view is not an editable document.".to_string();
-            return;
+        let (original_content, path, is_document) = if let Some(ref detail) = self.active_document {
+            (
+                detail.content.clone(),
+                Some(Path::new(detail.uri.as_str())),
+                true,
+            )
+        } else {
+            (self.full_view_content.clone(), None, false)
         };
-        let edit_result = edit_text_in_external_editor(
-            &detail.content,
-            Some(Path::new(detail.uri.as_str())),
-            "document",
-        );
+
+        let label = if is_document { "document" } else { "content" };
+        let edit_result = edit_text_in_external_editor(&original_content, path, label);
         self.needs_terminal_refresh = true;
 
         match edit_result {
             Ok(edited_contents) => {
-                if edited_contents == detail.content {
-                    self.status_message = format!("No document changes to save for {}", detail.uri);
+                if edited_contents == original_content {
+                    let msg = if is_document {
+                        format!(
+                            "No document changes to save for {}",
+                            self.active_document.as_ref().unwrap().uri
+                        )
+                    } else {
+                        "No changes to save.".to_string()
+                    };
+                    self.status_message = msg;
                     return;
                 }
 
-                let Some(client) = &self.client else {
-                    self.status_message = "No server connected.".to_string();
-                    return;
-                };
+                if is_document {
+                    let Some(client) = &self.client else {
+                        self.status_message = "No server connected.".to_string();
+                        return;
+                    };
 
-                let client = client.clone();
-                match self
-                    .rt
-                    .block_on(client.update_document(&detail.uri, &edited_contents))
-                {
-                    Ok(()) => {
-                        let mut updated_detail = detail;
-                        updated_detail.content = edited_contents;
-                        self.set_active_document(updated_detail.clone());
-                        self.status_message = format!("Saved document: {}", updated_detail.uri);
-                        if !self.records.is_empty() {
-                            self.fetch_list();
-                            self.mode = AppMode::FullScreenView;
-                            self.active_document = Some(updated_detail);
+                    let client = client.clone();
+                    let uri = self.active_document.as_ref().unwrap().uri.clone();
+                    match self
+                        .rt
+                        .block_on(client.update_document(&uri, &edited_contents))
+                    {
+                        Ok(()) => {
+                            let mut updated_detail = self.active_document.clone().unwrap();
+                            updated_detail.content = edited_contents;
+                            self.set_active_document(updated_detail.clone());
+                            self.status_message =
+                                format!("Saved document: {}", updated_detail.uri);
+                            if !self.records.is_empty() {
+                                self.fetch_list();
+                                self.mode = AppMode::FullScreenView;
+                                self.active_document = Some(updated_detail);
+                            }
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Document save failed: {}", e);
                         }
                     }
-                    Err(e) => {
-                        self.status_message = format!("Document save failed: {}", e);
-                    }
+                } else {
+                    self.full_view_content = edited_contents;
+                    self.status_message = "Content updated.".to_string();
                 }
             }
             Err(e) => {
@@ -772,16 +1223,8 @@ impl App {
         self.query_last_edit = None;
         self.focus_query_panel();
         self.status_message = match restored_results {
-            Ok(Some(count)) => format!(
-                "Loaded query file: {} (restored {} cached result{})",
-                display_query_path(&path, &self.query_root_dir),
-                count,
-                if count == 1 { "" } else { "s" }
-            ),
-            Ok(None) => format!(
-                "Loaded query file: {}",
-                display_query_path(&path, &self.query_root_dir)
-            ),
+            Ok(Some(_count)) => String::new(),
+            Ok(None) => String::new(),
             Err(e) => {
                 self.clear_query_results_view();
                 format!(
@@ -874,7 +1317,7 @@ impl App {
                         self.query_root_dir.display()
                     );
                 } else {
-                    self.mode = AppMode::QueryFileSelect;
+                    self.open_modal(AppMode::QueryFileSelect);
                 }
             }
             Err(e) => {
@@ -884,38 +1327,10 @@ impl App {
     }
 
     fn status_line(&self) -> Line<'static> {
-        let mode_span = match self.edit_mode {
-            EditMode::Navigate => Span::styled("NORMAL", Style::default().fg(Color::White)),
-            EditMode::Insert => {
-                Span::styled("INSERT", Style::default().fg(Color::White).bg(Color::Red))
-            }
-        };
-        let server = self
-            .config
-            .active_server
-            .as_deref()
-            .unwrap_or("(no server)");
-        let db = self
-            .config
-            .active_database
-            .as_deref()
-            .unwrap_or("(no database)");
-        let parts: Vec<String> = [
-            Some(server.to_string()),
-            Some(db.to_string()),
-            self.current_collection.as_ref().map(|c| c.to_string()),
-            Some(self.status_message.clone()),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .collect();
-        let joined = parts.join(" · ");
-        Line::from(vec![
-            Span::raw("  "),
-            mode_span,
-            Span::raw(format!(" · {}", joined)),
-        ])
+        let mode_span = Span::styled(self.edit_mode_label(), self.edit_mode_style());
+        let mut spans = vec![Span::raw("  "), mode_span];
+        spans.extend(self.status_identity_spans());
+        Line::from(spans)
     }
 
     fn execute_command(&mut self) {
@@ -924,6 +1339,10 @@ impl App {
 
         if cmd.is_empty() {
             return;
+        }
+
+        if self.mode == AppMode::StartPage {
+            self.mode = AppMode::Normal;
         }
 
         if !cmd.starts_with(':') && self.focus == Focus::Command {
@@ -968,6 +1387,14 @@ impl App {
             "tdes" => self.cmd_tdes(),
             "query" => self.show_query_editor(),
             "query-files" | "query-open" => self.open_query_file_picker(),
+            "folders" => self.open_tracked_folder_picker(),
+            "quit" => {
+                if let Err(e) = self.save_query_file_if_dirty() {
+                    self.results_text = format!("Save error: {}", e);
+                    return;
+                }
+                self.should_quit = true;
+            }
             _ => {
                 // Check if it's list:collection-name
                 if command.starts_with("list:") {
@@ -1012,12 +1439,12 @@ impl App {
         } else {
             self.server_list = list;
             self.server_list_state.select(Some(0));
-            self.mode = AppMode::ServerSelect;
+            self.open_modal(AppMode::ServerSelect);
         }
     }
 
     fn open_server_add(&mut self) {
-        self.mode = AppMode::ServerAdd;
+        self.open_modal(AppMode::ServerAdd);
         self.server_add_step = 0;
         self.server_add_fields = vec![String::new(); 5];
     }
@@ -1036,7 +1463,7 @@ impl App {
                         .and_then(|active| self.database_list.iter().position(|d| d == active))
                         .unwrap_or(0);
                     self.database_list_state.select(Some(selected));
-                    self.mode = AppMode::DatabaseSelect;
+                    self.open_modal(AppMode::DatabaseSelect);
                 }
                 Err(e) => {
                     self.results_text = format!("Error listing databases: {}", e);
@@ -1048,6 +1475,8 @@ impl App {
     }
 
     fn cmd_collections(&mut self) {
+        self.focus_results_panel();
+
         if let Some(client) = &self.client {
             let client = client.clone();
             match self.rt.block_on(client.list_collections()) {
@@ -1059,18 +1488,22 @@ impl App {
                         } else {
                             Some(0)
                         });
-                    self.mode = AppMode::CollectionSelect;
+                    self.open_modal(AppMode::CollectionSelect);
                 }
                 Err(e) => {
+                    self.clear_query_results_view();
                     self.results_text = format!("Error listing collections: {}", e);
                 }
             }
         } else {
+            self.clear_query_results_view();
             self.results_text = "No server connected.".to_string();
         }
     }
 
     fn cmd_tdes(&mut self) {
+        self.focus_results_panel();
+
         if let Some(client) = &self.client {
             let client = client.clone();
             let script = r#"
@@ -1091,20 +1524,20 @@ impl App {
                         }
                     }
                     if uris.is_empty() {
-                        self.records.clear();
-                        self.query_results.clear();
+                        self.clear_query_results_view();
                         self.results_text = "No TDEs found.".to_string();
                     } else {
                         self.set_query_results(uris);
                         self.status_message = format!("{} TDE(s) found", self.query_results.len());
-                        self.focus_results_panel();
                     }
                 }
                 Err(e) => {
+                    self.clear_query_results_view();
                     self.results_text = format!("Error listing TDEs: {}", e);
                 }
             }
         } else {
+            self.clear_query_results_view();
             self.results_text = "No server connected.".to_string();
         }
     }
@@ -1127,6 +1560,17 @@ impl App {
 
     fn fetch_list(&mut self) {
         self.recalculate_page_size();
+
+        // Enter document-list mode for the results pane and drop any stale query output.
+        self.records.clear();
+        self.list_state.select(None);
+        self.selected_indices.clear();
+        self.total_results = None;
+        self.query_results.clear();
+        self.query_results_timestamp = None;
+        self.query_results_state.select(None);
+        self.last_query_results_g = None;
+
         if let Some(client) = &self.client {
             let client = client.clone();
             let col = self.current_collection.as_deref();
@@ -1144,8 +1588,12 @@ impl App {
                     } else {
                         Some(0)
                     });
-                    self.selected_indices.clear();
                     self.focus_results_panel();
+                    self.results_text = if self.records.is_empty() {
+                        "No documents found.".to_string()
+                    } else {
+                        String::new()
+                    };
                     self.status_message = String::new();
                 }
                 Err(e) => {
@@ -1233,7 +1681,7 @@ impl App {
             self.status_message = "No records selected for deletion.".to_string();
             return;
         }
-        self.mode = AppMode::DeleteConfirm;
+        self.open_modal(AppMode::DeleteConfirm);
     }
 
     fn confirm_delete(&mut self) {
@@ -1255,7 +1703,7 @@ impl App {
                 }
             }
         }
-        self.mode = AppMode::Normal;
+        self.close_modal_with_focus(Focus::Results);
     }
 
     fn delete_uris(&self) -> Vec<String> {
@@ -1416,6 +1864,7 @@ fn format_xml(xml: &str) -> String {
 
 fn ui(f: &mut Frame, app: &mut App) {
     match app.mode {
+        AppMode::StartPage => ui_start_page(f, app),
         AppMode::FullScreenView => ui_fullscreen(f, app),
         AppMode::ServerAdd => ui_server_add(f, app),
         AppMode::ServerSelect => ui_server_select(f, app),
@@ -1426,6 +1875,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         AppMode::QueryFileCreate => ui_query_file_create(f, app),
         AppMode::QueryFileRename => ui_query_file_rename(f, app),
         AppMode::QueryFileDeleteConfirm => ui_query_file_delete_confirm(f, app),
+        AppMode::TrackedFolderSelect => ui_tracked_folder_select(f, app),
+        AppMode::TrackedFolderAdd => ui_tracked_folder_add(f, app),
+        AppMode::TrackedFolderDeleteConfirm => ui_tracked_folder_delete_confirm(f, app),
+        AppMode::TrackedFolderCacheClearConfirm => ui_tracked_folder_cache_clear_confirm(f, app),
         AppMode::HelpOverlay => ui_help(f, app),
         AppMode::Normal => ui_normal(f, app),
     }
@@ -1443,40 +1896,284 @@ where
     Block::default().borders(Borders::ALL).title(title_line)
 }
 
-fn keybindings_text(focus: &Focus, edit_mode: &EditMode) -> String {
-    let mut parts = Vec::new();
+fn format_relative_time(timestamp: SystemTime) -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(timestamp)
+        .unwrap_or_default();
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else if secs < 604800 {
+        format!("{}d ago", secs / 86400)
+    } else {
+        format!("{}w ago", secs / 604800)
+    }
+}
+
+fn display_folder_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn resolve_folder_input(current_root: &Path, input: &str) -> PathBuf {
+    if let Some(home_dir) = dirs::home_dir() {
+        if input == "~" {
+            return home_dir;
+        }
+        if let Some(stripped) = input.strip_prefix("~/") {
+            return home_dir.join(stripped);
+        }
+    }
+
+    let input_path = Path::new(input);
+    if input_path.is_absolute() {
+        input_path.to_path_buf()
+    } else {
+        current_root.join(input_path)
+    }
+}
+
+fn keybinding_items(
+    focus: &Focus,
+    edit_mode: &EditMode,
+    file_list_visible: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let mut items = Vec::new();
     match focus {
         Focus::Command => {
-            parts.push("Execute: Enter".to_string());
-            parts.push("Complete: Tab".to_string());
-            parts.push("Clear: Esc".to_string());
+            items.push(("Enter", "Execute"));
+            items.push(("Tab", "Complete"));
+            items.push(("Esc", "Close"));
         }
         Focus::Query => {
             if *edit_mode == EditMode::Insert {
-                parts.push("Normal: Esc".to_string());
-                parts.push("Run: ^R".to_string());
-                parts.push("Save: ^S".to_string());
+                items.push(("Esc", "Normal"));
+                items.push(("^R", "Run"));
+                items.push(("^S", "Save"));
             } else {
-                parts.push("Insert: i".to_string());
-                parts.push("Run: r".to_string());
-                parts.push("Editor: F4".to_string());
-                parts.push("New: n".to_string());
+                items.push(("i", "Insert"));
+                items.push(("r", "Run"));
+                items.push(("e", "Editor"));
+                items.push(("n", "New"));
+                if file_list_visible {
+                    items.push(("f", "Folders"));
+                }
             }
         }
         Focus::Results => {
-            parts.push("Open: Enter".to_string());
-            parts.push("Select: Space".to_string());
-            parts.push("Page: n/p".to_string());
-            parts.push("Filter: /".to_string());
-            parts.push("Delete: ^D".to_string());
+            items.push(("Enter", "Open"));
+            items.push(("Space", "Select"));
+            items.push(("n/p", "Page"));
+            items.push(("/", "Filter"));
+            items.push(("^D", "Delete"));
         }
         Focus::Filter => {
-            parts.push("Apply: Enter".to_string());
-            parts.push("Cancel: Esc".to_string());
+            items.push(("Enter", "Apply"));
+            items.push(("Esc", "Cancel"));
         }
     }
-    parts.push("Keybindings: ?".to_string());
-    parts.join(" | ")
+    items.push(("?", "Help"));
+    items
+}
+
+fn keybindings_line(focus: &Focus, edit_mode: &EditMode, file_list_visible: bool) -> Line<'static> {
+    let items = keybinding_items(focus, edit_mode, file_list_visible);
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(Color::Gray);
+    let divider_style = Style::default().fg(Color::DarkGray);
+
+    let mut spans = Vec::new();
+    for (i, (key, label)) in items.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", divider_style));
+        }
+        spans.push(Span::styled(key, key_style));
+        spans.push(Span::styled(format!(" {}", label), label_style));
+    }
+
+    Line::from(spans)
+}
+
+fn ui_start_page(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let mut prompt_width = area.width.saturating_sub(8);
+    prompt_width = prompt_width.min(72);
+    if prompt_width < 20 {
+        prompt_width = area.width.saturating_sub(2);
+    }
+    if prompt_width == 0 {
+        prompt_width = area.width.max(1);
+    }
+
+    let prompt_height = 4;
+
+    let prompt_area = Rect {
+        x: area.x + area.width.saturating_sub(prompt_width) / 2,
+        y: area.y + area.height.saturating_sub(prompt_height) / 2,
+        width: prompt_width,
+        height: prompt_height,
+    };
+
+    let bottom_y = area.y + area.height.saturating_sub(1);
+    let title_y = prompt_area.y.saturating_sub(2);
+    let footer_y = prompt_area
+        .y
+        .saturating_add(prompt_area.height)
+        .saturating_add(1)
+        .min(bottom_y);
+
+    let title = Paragraph::new(format!("MARKLOGIC TUI v{}", env!("CARGO_PKG_VERSION")))
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_widget(
+        title,
+        Rect {
+            x: area.x,
+            y: title_y,
+            width: area.width,
+            height: 1,
+        },
+    );
+
+    let footer = Paragraph::new("Press '?' for help on any screen")
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(
+        footer,
+        Rect {
+            x: area.x,
+            y: footer_y,
+            width: area.width,
+            height: 1,
+        },
+    );
+
+    let panel_bg = Color::Rgb(84, 84, 84);
+    let command_style = Style::default().fg(Color::White).bg(panel_bg);
+    f.render_widget(Block::default().style(command_style), prompt_area);
+    let bar_style = Style::default()
+        .fg(app.edit_mode_accent_color())
+        .bg(panel_bg);
+
+    let command_input = app
+        .command_input
+        .strip_prefix(':')
+        .unwrap_or(app.command_input.as_str());
+
+    let bar_glyph = "▌";
+    let top_blank = Line::from(vec![Span::styled(bar_glyph, bar_style)]);
+    f.render_widget(
+        Paragraph::new(top_blank).style(command_style),
+        Rect {
+            x: prompt_area.x,
+            y: prompt_area.y,
+            width: prompt_area.width,
+            height: 1,
+        },
+    );
+
+    let command_line = Line::from(vec![
+        Span::styled(bar_glyph, bar_style),
+        Span::raw(" "),
+        Span::raw(command_input.to_string()),
+    ]);
+    f.render_widget(
+        Paragraph::new(command_line).style(command_style),
+        Rect {
+            x: prompt_area.x,
+            y: prompt_area.y.saturating_add(1),
+            width: prompt_area.width,
+            height: 1,
+        },
+    );
+
+    let middle_blank = Line::from(vec![Span::styled(bar_glyph, bar_style)]);
+    f.render_widget(
+        Paragraph::new(middle_blank).style(command_style),
+        Rect {
+            x: prompt_area.x,
+            y: prompt_area.y.saturating_add(2),
+            width: prompt_area.width,
+            height: 1,
+        },
+    );
+
+    let mut status_spans = vec![
+        Span::styled(bar_glyph, bar_style),
+        Span::raw(" "),
+        Span::styled(app.edit_mode_label(), app.start_page_mode_style()),
+    ];
+    status_spans.extend(app.status_identity_spans());
+    let status_line = Line::from(status_spans);
+    f.render_widget(
+        Paragraph::new(status_line).style(command_style),
+        Rect {
+            x: prompt_area.x,
+            y: prompt_area.y.saturating_add(3),
+            width: prompt_area.width,
+            height: 1,
+        },
+    );
+
+    if app.focus == Focus::Command {
+        let cursor_offset =
+            (command_input.chars().count() as u16 + 2).min(prompt_area.width.saturating_sub(1));
+        let cursor_x = prompt_area.x + cursor_offset;
+        f.set_cursor_position((cursor_x, prompt_area.y.saturating_add(1)));
+    }
+
+    if !app.autocomplete_suggestions.is_empty() && app.focus == Focus::Command {
+        let items: Vec<ListItem> = app
+            .autocomplete_suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, &cmd)| {
+                let desc = App::COMMANDS
+                    .iter()
+                    .find(|(c, _)| *c == cmd)
+                    .map(|(_, d)| *d)
+                    .unwrap_or("");
+                let text = format!(" {} - {}", cmd, desc);
+                let style = if i == app.autocomplete_selected {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                ListItem::new(text).style(style)
+            })
+            .collect();
+
+        let height = (items.len() as u16 + 2).min(12);
+        let popup_y = if prompt_area
+            .y
+            .saturating_add(prompt_area.height)
+            .saturating_add(height)
+            <= bottom_y.saturating_add(1)
+        {
+            prompt_area.y.saturating_add(prompt_area.height)
+        } else {
+            prompt_area.y.saturating_sub(height)
+        };
+        let popup_area = Rect {
+            x: prompt_area.x,
+            y: popup_y,
+            width: prompt_area.width,
+            height,
+        };
+        let list =
+            List::new(items).block(Block::default().borders(Borders::ALL).title("Suggestions"));
+        f.render_widget(Clear, popup_area);
+        f.render_widget(list, popup_area);
+    }
 }
 
 fn ui_normal(f: &mut Frame, app: &mut App) {
@@ -1484,7 +2181,8 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
     let cmd_visible = app.focus == Focus::Command
         || app.focus == Focus::Filter
         || !app.command_input.is_empty()
-        || app.uri_filter.is_some();
+        || app.uri_filter.is_some()
+        || !app.status_message.is_empty();
     let cmd_height = if cmd_visible { 1 } else { 0 };
 
     let chunks = Layout::default()
@@ -1503,10 +2201,8 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
         .split(chunks[0]);
     let status = Paragraph::new(app.status_line());
     f.render_widget(status, top_chunks[0]);
-    let kb_text = keybindings_text(&app.focus, &app.edit_mode);
-    let kb_bar = Paragraph::new(kb_text)
-        .style(Style::default().fg(Color::Cyan))
-        .alignment(Alignment::Right);
+    let kb_line = keybindings_line(&app.focus, &app.edit_mode, app.file_list_visible);
+    let kb_bar = Paragraph::new(kb_line).alignment(Alignment::Right);
     f.render_widget(kb_bar, top_chunks[1]);
 
     // Content area: query on top (if visible), results on bottom
@@ -1533,7 +2229,7 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
             let cursor_x = chunks[2].x + app.filter_input.chars().count() as u16 + 1;
             let cursor_y = chunks[2].y;
             f.set_cursor_position((cursor_x, cursor_y));
-        } else {
+        } else if !app.command_input.is_empty() || app.focus == Focus::Command {
             let command_style = Style::default().fg(Color::White).bg(Color::DarkGray);
             f.render_widget(Block::default().style(command_style), chunks[2]);
 
@@ -1556,6 +2252,11 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
                 let cursor_y = chunks[2].y;
                 f.set_cursor_position((cursor_x, cursor_y));
             }
+        } else if !app.status_message.is_empty() {
+            let status_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+            f.render_widget(Block::default().style(status_style), chunks[2]);
+            let status_widget = Paragraph::new(app.status_message.as_str()).style(status_style);
+            f.render_widget(status_widget, chunks[2]);
         }
     }
 
@@ -1590,14 +2291,14 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
             Color::Rgb(35, 35, 35)
         };
         let query_block = if should_show_file_list {
-            let title_line = Line::from(vec![Span::raw("[2]─ "), Span::raw(app.query_title())]);
+            let title_line = Line::from(vec![Span::raw("[1]─ "), Span::raw(app.query_title())]);
             Block::default()
                 .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
                 .title(title_line)
                 .border_style(border_style)
                 .style(Style::default().bg(editor_bg))
         } else {
-            panel_block(app.query_title(), "[2]")
+            panel_block(app.query_title(), "[1]")
                 .border_style(border_style)
                 .style(Style::default().bg(editor_bg))
         };
@@ -1641,7 +2342,7 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
                 .block(
                     Block::default()
                         .borders(Borders::TOP | Borders::RIGHT | Borders::BOTTOM)
-                        .title("Files")
+                        .title("Files [f=folders]")
                         .border_style(file_list_style)
                         .style(Style::default().bg(Color::Black)),
                 )
@@ -1711,7 +2412,7 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
         let table = Table::new(rows, widths)
             .header(header)
             .block(
-                panel_block(title, "[3]")
+                panel_block(title, "[2]")
                     .border_style(results_style)
                     .title(Line::from(page_title).alignment(Alignment::Right)),
             )
@@ -1740,6 +2441,10 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
 
         let count = app.total_results.unwrap_or(app.query_results.len());
         let title = format!("Query Results ({})", count);
+        let mut block = panel_block(title, "[2]").border_style(results_style);
+        if let Some(ts) = app.query_results_timestamp {
+            block = block.title(Line::from(format_relative_time(ts)).alignment(Alignment::Right));
+        }
         let header = Row::new(vec!["#", "Result"]).style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
@@ -1748,13 +2453,13 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
         let widths = [Constraint::Length(4), Constraint::Min(0)];
         let table = Table::new(rows, widths)
             .header(header)
-            .block(panel_block(title, "[3]").border_style(results_style))
+            .block(block)
             .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
             .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
         f.render_stateful_widget(table, results_area, &mut app.query_results_state);
     } else {
         let results = Paragraph::new(app.results_text.as_str())
-            .block(panel_block("Results", "[3]").border_style(results_style))
+            .block(panel_block("Results", "[2]").border_style(results_style))
             .wrap(Wrap { trim: false });
         f.render_widget(results, results_area);
     }
@@ -1824,10 +2529,9 @@ fn ui_fullscreen(f: &mut Frame, app: &mut App) {
         "j/k: scroll".to_string(),
         "d/u: page".to_string(),
         "gg/G: top/bottom".to_string(),
+        "e: edit".to_string(),
+        "?: help".to_string(),
     ];
-    if app.active_document.is_some() {
-        kb_parts.push("^E: edit".to_string());
-    }
     kb_parts.push(format!("{}%", pct));
     let kb_bar = Paragraph::new(kb_parts.join(" | "))
         .style(Style::default().fg(Color::Cyan))
@@ -1983,6 +2687,117 @@ fn ui_query_file_delete_confirm(f: &mut Frame, app: &App) {
     f.render_widget(para, area);
 }
 
+fn ui_tracked_folder_select(f: &mut Frame, app: &mut App) {
+    let area = centered_rect(70, 70, f.area());
+    f.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = app
+        .tracked_folder_items
+        .iter()
+        .map(|item| match item {
+            TrackedFolderMenuItem::Header(title) => ListItem::new(format!("  {}", title)).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            TrackedFolderMenuItem::Folder(entry) => {
+                let path = Path::new(&entry.path);
+                let active_marker = if path == app.query_root_dir {
+                    " (active)"
+                } else {
+                    ""
+                };
+                let favorite_marker = if entry.favorite { " [fav]" } else { "" };
+                let last_accessed = entry
+                    .last_accessed
+                    .map(|secs| format_relative_time(UNIX_EPOCH + Duration::from_secs(secs)))
+                    .unwrap_or_else(|| "never".to_string());
+                ListItem::new(format!(
+                    "  {}{}{} · {}",
+                    display_folder_path(path),
+                    favorite_marker,
+                    active_marker,
+                    last_accessed
+                ))
+            }
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Folders [Enter=switch, a=add, f=favorite, d=remove, c=clear cache]"),
+        )
+        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, area, &mut app.tracked_folder_list_state);
+}
+
+fn ui_tracked_folder_add(f: &mut Frame, app: &App) {
+    let area = centered_rect(70, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let input = Paragraph::new(app.tracked_folder_input.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Add Folder (~, absolute, or relative path)"),
+    );
+    f.render_widget(input, area);
+    f.set_cursor_position((
+        area.x + app.tracked_folder_input.len() as u16 + 1,
+        area.y + 1,
+    ));
+}
+
+fn ui_tracked_folder_delete_confirm(f: &mut Frame, app: &App) {
+    let area = centered_rect(70, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let folder = app
+        .tracked_folder_delete_target
+        .as_deref()
+        .map(display_folder_path)
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let text = format!(
+        "Remove tracked folder '{}' ?\n\nThis does not delete files on disk.\n\nPress 'y' to confirm, 'n' or Esc to cancel",
+        folder
+    );
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Confirm Folder Remove")
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
+fn ui_tracked_folder_cache_clear_confirm(f: &mut Frame, app: &App) {
+    let area = centered_rect(70, 22, f.area());
+    f.render_widget(Clear, area);
+
+    let folder = app
+        .tracked_folder_cache_clear_target
+        .as_deref()
+        .map(display_folder_path)
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let text = format!(
+        "Clear cached query results for '{}' ?\n\nThis deletes that folder's .marklogic-tui cache directory.\n\nPress 'y' to confirm, 'n' or Esc to cancel",
+        folder
+    );
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Confirm Cache Clear")
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
 fn ui_delete_confirm(f: &mut Frame, app: &App) {
     let uris = app.delete_uris();
     let area = centered_rect(70, 60, f.area());
@@ -2067,15 +2882,31 @@ fn ui_server_add(f: &mut Frame, app: &App) {
     }
 }
 
-fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode) -> Vec<&'static str> {
+fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode, mode: &AppMode) -> Vec<&'static str> {
+    if *mode == AppMode::FullScreenView {
+        return vec![
+            "",
+            "  Document View",
+            "    Esc / q    Close document view",
+            "    e          Edit in external editor",
+            "    j / k      Scroll down/up",
+            "    d / u      Page down/up",
+            "    g / G      Top/bottom",
+            "    Space      Page down",
+            "    PageUp     Page up",
+            "",
+            "  Press ? or Esc to close this help",
+        ];
+    }
+
     let mut lines = vec![
         "",
         "  Global",
         "    ?          Show/hide this help",
         "    :          Open command input",
-        "    1          Focus command panel",
-        "    2          Focus query panel",
-        "    3          Focus results panel",
+        "    1          Focus query panel",
+        "    2          Focus results panel",
+        "    3          Focus command panel",
         "    \\          Toggle file list",
         "    Tab        Cycle focus forward",
         "    Shift+Tab  Cycle focus backward",
@@ -2089,7 +2920,7 @@ fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode) -> Vec<&'static str>
                 "    Enter      Execute command",
                 "    Tab        Accept autocomplete / cycle panels",
                 "    Up/Down    Navigate autocomplete",
-                "    Esc        Clear input",
+                "    Esc        Close command line",
                 "",
             ]);
         }
@@ -2110,11 +2941,12 @@ fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode) -> Vec<&'static str>
                     "    i          Enter insert mode (editor)",
                     "    j/k        Navigate + auto-load file",
                     "    Enter      Load selected file",
+                    "    f          Open tracked folders",
                     "    n          New query file",
                     "    m          Rename selected file",
                     "    Delete     Delete selected file",
                     "    r / F5     Run query",
-                    "    F4         Open in external editor",
+                    "    e          Open in external editor",
                     "    \\          Toggle file list",
                     "    g/G        Go to top/bottom of file list",
                     "",
@@ -2155,7 +2987,7 @@ fn ui_help(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 70, f.area());
     f.render_widget(Clear, area);
 
-    let help_lines = help_text_for_focus(&app.focus, &app.edit_mode);
+    let help_lines = help_text_for_focus(&app.focus, &app.edit_mode, &app.mode);
     let text = help_lines.join("\n");
 
     let block = Block::default()
@@ -2202,6 +3034,7 @@ fn handle_event(app: &mut App) -> Result<bool> {
             }
 
             match app.mode {
+                AppMode::StartPage => {}
                 AppMode::FullScreenView => return handle_fullscreen_key(app, key),
                 AppMode::ServerAdd => return handle_server_add_key(app, key),
                 AppMode::ServerSelect => return handle_server_select_key(app, key),
@@ -2213,6 +3046,14 @@ fn handle_event(app: &mut App) -> Result<bool> {
                 AppMode::QueryFileRename => return handle_query_file_rename_key(app, key),
                 AppMode::QueryFileDeleteConfirm => {
                     return handle_query_file_delete_confirm_key(app, key);
+                }
+                AppMode::TrackedFolderSelect => return handle_tracked_folder_select_key(app, key),
+                AppMode::TrackedFolderAdd => return handle_tracked_folder_add_key(app, key),
+                AppMode::TrackedFolderDeleteConfirm => {
+                    return handle_tracked_folder_delete_confirm_key(app, key);
+                }
+                AppMode::TrackedFolderCacheClearConfirm => {
+                    return handle_tracked_folder_cache_clear_confirm_key(app, key);
                 }
                 AppMode::HelpOverlay => {
                     if key.code == KeyCode::Char('?') || key.code == KeyCode::Esc {
@@ -2255,28 +3096,25 @@ fn handle_event(app: &mut App) -> Result<bool> {
                 return Ok(false);
             }
 
-            // Double-Esc in navigation mode: clear all filters and re-fetch
+            // Double-Esc in navigation mode: return to the centered start page
             if key.code == KeyCode::Esc {
                 if app.edit_mode == EditMode::Navigate {
-                    if let Some(last) = app.last_esc {
-                        if last.elapsed().as_millis() < 500 {
-                            if let Err(e) = app.save_query_file_if_dirty() {
-                                app.status_message = format!("Save error: {}", e);
+                    if app.mode != AppMode::StartPage {
+                        if let Some(last) = app.last_esc {
+                            if last.elapsed().as_millis() < 500 {
+                                if let Err(e) = app.save_query_file_if_dirty() {
+                                    app.status_message = format!("Save error: {}", e);
+                                    return Ok(false);
+                                }
+                                app.last_esc = None;
+                                app.enter_start_page();
                                 return Ok(false);
                             }
-                            app.last_esc = None;
-                            app.current_collection = None;
-                            app.uri_filter = None;
-                            app.filter_input.clear();
-                            app.current_page = 0;
-                            app.query_visible = false;
-                            app.focus_results_panel();
-                            app.status_message = "Cleared all filters".to_string();
-                            app.fetch_list();
-                            return Ok(false);
                         }
+                        app.last_esc = Some(Instant::now());
+                    } else {
+                        app.last_esc = None;
                     }
-                    app.last_esc = Some(Instant::now());
                 } else {
                     app.last_esc = None;
                 }
@@ -2305,6 +3143,10 @@ fn handle_event(app: &mut App) -> Result<bool> {
                 Focus::Results => handle_results_key(app, key),
                 Focus::Filter => handle_filter_key(app, key),
             }
+
+            if app.should_quit {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -2321,27 +3163,29 @@ fn handle_navigation_mode_key(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Char('1') if is_navigation_surface => {
-            app.focus_command_panel();
-            true
-        }
-        KeyCode::Char('2') if is_navigation_surface => {
             app.show_query_editor();
             app.edit_mode = EditMode::Navigate;
             true
         }
-        KeyCode::Char('3') if is_navigation_surface => {
+        KeyCode::Char('2') if is_navigation_surface => {
             app.focus_results_panel();
+            true
+        }
+        KeyCode::Char('3') if is_navigation_surface => {
+            app.focus_command_panel();
+            app.command_input = ":".to_string();
+            app.update_autocomplete();
             true
         }
         KeyCode::Char('\\') if is_navigation_surface => {
             app.toggle_file_list();
             true
         }
-        KeyCode::Tab if is_navigation_surface => {
+        KeyCode::Tab if is_navigation_surface && app.mode != AppMode::StartPage => {
             app.cycle_panel_focus();
             true
         }
-        KeyCode::BackTab if is_navigation_surface => {
+        KeyCode::BackTab if is_navigation_surface && app.mode != AppMode::StartPage => {
             app.cycle_panel_focus_backward();
             true
         }
@@ -2408,9 +3252,7 @@ fn map_query_navigation_key(key: KeyEvent) -> Option<Input> {
 }
 
 fn handle_query_key(app: &mut App, key: KeyEvent) {
-    if key.code == KeyCode::F(4) {
-        app.open_query_in_external_editor();
-    } else if key.code == KeyCode::F(5) {
+    if key.code == KeyCode::F(5) {
         app.execute_query();
     } else if app.edit_mode == EditMode::Navigate && key.modifiers.is_empty() {
         if app.file_list_visible {
@@ -2450,13 +3292,15 @@ fn handle_query_key(app: &mut App, key: KeyEvent) {
                         }
                     }
                 }
+                KeyCode::Char('e') => app.open_query_in_external_editor(),
+                KeyCode::Char('f') => app.open_tracked_folder_picker(),
                 KeyCode::Char('n') => app.open_query_file_create(),
                 KeyCode::Char('m') => app.start_rename_query_file(),
                 KeyCode::Delete => {
                     if let Some(sel) = app.query_file_list_state.selected() {
                         if let Some(path) = app.query_files.get(sel).cloned() {
                             app.file_delete_target = Some(path);
-                            app.mode = AppMode::QueryFileDeleteConfirm;
+                            app.open_modal(AppMode::QueryFileDeleteConfirm);
                         }
                     }
                 }
@@ -2488,6 +3332,7 @@ fn handle_query_key(app: &mut App, key: KeyEvent) {
         } else {
             // Editor navigation mode (no file list visible)
             match key.code {
+                KeyCode::Char('e') => app.open_query_in_external_editor(),
                 KeyCode::Char('o') => app.open_query_file_picker(),
                 KeyCode::Char('n') => app.open_query_file_create(),
                 KeyCode::Char('r') => app.execute_query(),
@@ -2624,17 +3469,21 @@ fn external_editor_command(path: &Path) -> Command {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppMode, EditMode, Focus, handle_command_key, handle_filter_key,
-        handle_navigation_mode_key, handle_query_insert_transition_key, handle_results_key,
-        map_query_navigation_key, temp_editor_path,
+        App, AppMode, EditMode, Focus, TrackedFolderEntry, TrackedFolderMenuItem,
+        display_folder_path, handle_command_key, handle_filter_key, handle_fullscreen_key,
+        handle_navigation_mode_key, handle_query_insert_transition_key, handle_query_key,
+        handle_results_key, handle_server_select_key, map_query_navigation_key, resolve_folder_input,
+        temp_editor_path,
     };
     use crate::config::AppConfig;
+    use crate::tracked_folder::TrackedFolderStore;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::style::{Color, Style};
     use ratatui::widgets::{ListState, TableState};
     use std::{
         fs,
         path::{Path, PathBuf},
-        time::Duration,
+        time::{Duration, SystemTime},
     };
     use tokio::runtime::Runtime;
 
@@ -2642,19 +3491,27 @@ mod tests {
         App {
             config: AppConfig::default(),
             client: None,
-            focus: Focus::Command,
+            focus: Focus::Results,
             edit_mode: EditMode::Navigate,
             mode: AppMode::Normal,
             previous_mode: None,
+            modal_origin_focus: None,
             command_input: String::new(),
             query_editor: App::new_query_editor(Vec::new()),
             query_visible: false,
             needs_terminal_refresh: false,
+            should_quit: false,
             query_root_dir: PathBuf::from("."),
             query_result_cache_dir: PathBuf::from(".marklogic-tui"),
             query_files: Vec::new(),
             active_query_file: None,
             query_file_list_state: ListState::default(),
+            tracked_folders: TrackedFolderStore::default(),
+            tracked_folder_items: Vec::new(),
+            tracked_folder_list_state: ListState::default(),
+            tracked_folder_input: String::new(),
+            tracked_folder_delete_target: None,
+            tracked_folder_cache_clear_target: None,
             file_list_visible: true,
             file_delete_target: None,
             rename_file_input: String::new(),
@@ -2666,6 +3523,7 @@ mod tests {
             results_text: String::new(),
             status_message: String::new(),
             query_results: Vec::new(),
+            query_results_timestamp: None,
             query_results_state: TableState::default(),
             records: Vec::new(),
             list_state: TableState::default(),
@@ -2737,23 +3595,22 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)
         ));
-        assert_eq!(app.focus, Focus::Command);
-        assert_eq!(app.edit_mode, EditMode::Navigate);
-
-        app.focus_results_panel();
-        assert!(handle_navigation_mode_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)
-        ));
         assert_eq!(app.focus, Focus::Query);
         assert_eq!(app.edit_mode, EditMode::Navigate);
         assert!(app.query_visible);
 
         assert!(handle_navigation_mode_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)
         ));
         assert_eq!(app.focus, Focus::Results);
+        assert_eq!(app.edit_mode, EditMode::Navigate);
+
+        assert!(handle_navigation_mode_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)
+        ));
+        assert_eq!(app.focus, Focus::Command);
         assert_eq!(app.edit_mode, EditMode::Navigate);
     }
 
@@ -2790,6 +3647,91 @@ mod tests {
 
         assert_eq!(app.focus, Focus::Command);
         assert_eq!(app.command_input, ":query");
+    }
+
+    #[test]
+    fn modal_input_command_escape_closes_and_focuses_next_panel() {
+        let mut app = test_app();
+        app.focus = Focus::Command;
+        app.command_input = ":q".to_string();
+        app.update_autocomplete();
+
+        handle_command_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.focus, Focus::Query);
+        assert!(app.command_input.is_empty());
+        assert!(app.autocomplete_suggestions.is_empty());
+    }
+
+    #[test]
+    fn start_page_escape_keeps_command_focus() {
+        let mut app = test_app();
+        app.mode = AppMode::StartPage;
+        app.focus = Focus::Command;
+        app.command_input = ":q".to_string();
+        app.update_autocomplete();
+
+        handle_command_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, AppMode::StartPage);
+        assert_eq!(app.focus, Focus::Command);
+        assert!(app.command_input.is_empty());
+        assert!(app.autocomplete_suggestions.is_empty());
+    }
+
+    #[test]
+    fn start_page_execute_command_switches_to_normal_mode() {
+        let mut app = test_app();
+        app.mode = AppMode::StartPage;
+        app.focus = Focus::Command;
+        app.command_input = ":clear".to_string();
+
+        app.execute_command();
+
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn quit_command_sets_quit_flag() {
+        let mut app = test_app();
+        app.command_input = ":quit".to_string();
+
+        app.execute_command();
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn quit_command_leaves_start_page_and_sets_quit_flag() {
+        let mut app = test_app();
+        app.mode = AppMode::StartPage;
+        app.focus = Focus::Command;
+        app.command_input = ":quit".to_string();
+
+        app.execute_command();
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn enter_start_page_resets_focus_and_command_state() {
+        let mut app = test_app();
+        app.mode = AppMode::Normal;
+        app.focus = Focus::Results;
+        app.query_visible = true;
+        app.command_input = ":list".to_string();
+        app.autocomplete_suggestions = vec![":list"];
+        app.autocomplete_selected = 0;
+
+        app.enter_start_page();
+
+        assert_eq!(app.mode, AppMode::StartPage);
+        assert_eq!(app.focus, Focus::Command);
+        assert!(!app.query_visible);
+        assert!(app.command_input.is_empty());
+        assert!(app.autocomplete_suggestions.is_empty());
+        assert_eq!(app.autocomplete_selected, 0);
     }
 
     #[test]
@@ -2874,7 +3816,7 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
         ));
-        assert_eq!(app.focus, Focus::Command);
+        assert_eq!(app.focus, Focus::Query);
     }
 
     #[test]
@@ -2970,6 +3912,174 @@ mod tests {
     }
 
     #[test]
+    fn resolve_folder_input_supports_relative_and_home_paths() {
+        let current_root = Path::new("/tmp/project");
+
+        assert_eq!(
+            resolve_folder_input(current_root, "nested"),
+            Path::new("/tmp/project/nested")
+        );
+
+        if let Some(home_dir) = dirs::home_dir() {
+            assert_eq!(resolve_folder_input(current_root, "~"), home_dir);
+            assert_eq!(
+                resolve_folder_input(current_root, "~/queries"),
+                home_dir.join("queries")
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_tracked_folder_items_groups_favorites_before_recents() {
+        let mut app = test_app();
+        app.query_root_dir = PathBuf::from("/tmp/current");
+        app.tracked_folders = TrackedFolderStore {
+            folders: vec![
+                TrackedFolderEntry {
+                    path: "/tmp/recent-a".to_string(),
+                    favorite: false,
+                    last_accessed: Some(2),
+                },
+                TrackedFolderEntry {
+                    path: "/tmp/favorite".to_string(),
+                    favorite: true,
+                    last_accessed: Some(3),
+                },
+                TrackedFolderEntry {
+                    path: "/tmp/recent-b".to_string(),
+                    favorite: false,
+                    last_accessed: Some(4),
+                },
+            ],
+        };
+
+        app.rebuild_tracked_folder_items();
+
+        assert!(matches!(
+            app.tracked_folder_items.first(),
+            Some(TrackedFolderMenuItem::Header("Favorites"))
+        ));
+        assert!(matches!(
+            app.tracked_folder_items.get(1),
+            Some(TrackedFolderMenuItem::Folder(entry)) if entry.path == "/tmp/favorite"
+        ));
+        assert!(matches!(
+            app.tracked_folder_items.get(2),
+            Some(TrackedFolderMenuItem::Header("Recent"))
+        ));
+        assert!(matches!(
+            app.tracked_folder_items.get(3),
+            Some(TrackedFolderMenuItem::Folder(entry)) if entry.path == "/tmp/recent-b"
+        ));
+        assert!(matches!(
+            app.tracked_folder_items.get(4),
+            Some(TrackedFolderMenuItem::Folder(entry)) if entry.path == "/tmp/recent-a"
+        ));
+    }
+
+    #[test]
+    fn query_file_list_f_key_opens_tracked_folder_picker() {
+        let mut app = test_app();
+        app.focus_query_panel();
+        app.file_list_visible = true;
+        app.tracked_folders = TrackedFolderStore {
+            folders: vec![TrackedFolderEntry {
+                path: "/tmp/folder".to_string(),
+                favorite: false,
+                last_accessed: Some(1),
+            }],
+        };
+
+        handle_query_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.mode, AppMode::TrackedFolderSelect);
+        assert!(matches!(
+            app.tracked_folder_items.get(1),
+            Some(TrackedFolderMenuItem::Folder(entry)) if entry.path == "/tmp/folder"
+        ));
+    }
+
+    #[test]
+    fn folders_command_opens_tracked_folder_picker() {
+        let mut app = test_app();
+        app.command_input = ":folders".to_string();
+        app.tracked_folders = TrackedFolderStore {
+            folders: vec![TrackedFolderEntry {
+                path: "/tmp/folder".to_string(),
+                favorite: false,
+                last_accessed: Some(1),
+            }],
+        };
+
+        app.execute_command();
+
+        assert_eq!(app.mode, AppMode::TrackedFolderSelect);
+        assert!(matches!(
+            app.tracked_folder_items.get(1),
+            Some(TrackedFolderMenuItem::Folder(entry)) if entry.path == "/tmp/folder"
+        ));
+    }
+
+    #[test]
+    fn switch_query_root_refreshes_supported_files_and_cache_dir() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("switch-query-root");
+        let folder_one = temp_dir.join("one");
+        let folder_two = temp_dir.join("two");
+        fs::create_dir_all(&folder_one).unwrap();
+        fs::create_dir_all(&folder_two).unwrap();
+        fs::write(folder_two.join("query-2.xqy"), "xquery version \"1.0-ml\";").unwrap();
+        app.query_root_dir = folder_one.clone();
+        app.tracked_folders = TrackedFolderStore::default();
+        let canonical_folder_two = fs::canonicalize(&folder_two).unwrap();
+
+        app.switch_query_root(folder_two.clone()).unwrap();
+
+        assert_eq!(app.query_root_dir, canonical_folder_two);
+        assert_eq!(
+            app.query_result_cache_dir,
+            app.query_root_dir.join(".marklogic-tui")
+        );
+        assert_eq!(
+            app.query_files,
+            vec![app.query_root_dir.join("query-2.xqy")]
+        );
+        assert_eq!(
+            app.active_query_file,
+            Some(app.query_root_dir.join("query-2.xqy"))
+        );
+        assert!(
+            app.tracked_folders
+                .folders
+                .iter()
+                .any(|entry| entry.path == display_folder_path(&app.query_root_dir))
+        );
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn clear_selected_tracked_folder_cache_removes_marklogic_tui_dir() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("clear-folder-cache");
+        let folder = temp_dir.join("queries");
+        let cache_dir = folder.join(".marklogic-tui");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join("results-v1.json"), "{}").unwrap();
+        app.tracked_folder_cache_clear_target = Some(folder.clone());
+
+        app.confirm_clear_selected_tracked_folder_cache();
+
+        assert!(!cache_dir.exists());
+        assert_eq!(app.mode, AppMode::TrackedFolderSelect);
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
     fn modal_input_setting_query_results_keeps_query_focus() {
         let mut app = test_app();
         app.focus_query_panel();
@@ -3022,6 +4132,67 @@ mod tests {
     }
 
     #[test]
+    fn query_result_cache_persists_timestamp() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("query-cache-timestamp");
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let query_path = temp_dir.join("query-1.xqy");
+        fs::write(&query_path, "xquery version \"1.0-ml\";").unwrap();
+
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+
+        // Set results with a specific timestamp
+        app.set_query_results(vec!["result".to_string()]);
+        let before_save = app.query_results_timestamp.unwrap();
+        app.persist_query_results_for_path(&query_path);
+
+        // Clear and restore
+        app.clear_query_results_view();
+        assert!(app.query_results_timestamp.is_none());
+
+        app.load_query_file(query_path).unwrap();
+        assert_eq!(app.query_results, vec!["result".to_string()]);
+        let after_restore = app.query_results_timestamp.unwrap();
+
+        // Timestamp should be preserved (within 1 second tolerance)
+        let diff = after_restore
+            .duration_since(before_save)
+            .unwrap_or_default()
+            .as_secs();
+        assert_eq!(
+            diff, 0,
+            "Timestamp should be preserved through cache round-trip"
+        );
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn load_query_file_success_does_not_set_status_message() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("query-load-status-message");
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let query_path = temp_dir.join("query-1.xqy");
+        fs::write(&query_path, "xquery version \"1.0-ml\";").unwrap();
+
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+
+        app.load_query_file(query_path.clone()).unwrap();
+        assert!(app.status_message.is_empty());
+
+        app.set_query_results(vec!["result".to_string()]);
+        app.persist_query_results_for_path(&query_path);
+        app.load_query_file(query_path).unwrap();
+        assert!(app.status_message.is_empty());
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
     fn load_query_file_without_cached_results_clears_previous_query_results() {
         let mut app = test_app();
         let temp_dir = temp_test_dir("query-cache-miss");
@@ -3048,6 +4219,84 @@ mod tests {
         assert_eq!(app.query_results_state.selected(), None);
 
         fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn fetch_list_clears_stale_query_results_before_list_mode() {
+        let mut app = test_app();
+        app.focus_results_panel();
+        app.set_query_results(vec!["stale-query-result".to_string()]);
+        app.results_text = "old query text".to_string();
+        app.query_results_timestamp = Some(SystemTime::now());
+        assert!(!app.query_results.is_empty());
+
+        app.focus_results_panel();
+        assert_eq!(app.focus, Focus::Results);
+
+        app.fetch_list();
+
+        assert!(app.query_results.is_empty());
+        assert_eq!(app.query_results_state.selected(), None);
+        assert_eq!(app.results_text, "No server connected.");
+        assert_eq!(app.query_results_timestamp, None);
+        assert_eq!(app.focus, Focus::Results);
+    }
+
+    #[test]
+    fn cmd_tdes_without_server_keeps_results_focus() {
+        let mut app = test_app();
+        app.focus = Focus::Command;
+
+        app.cmd_tdes();
+
+        assert_eq!(app.focus, Focus::Results);
+        assert_eq!(app.results_text, "No server connected.");
+    }
+
+    #[test]
+    fn cmd_collections_without_server_keeps_results_focus() {
+        let mut app = test_app();
+        app.focus = Focus::Command;
+
+        app.cmd_collections();
+
+        assert_eq!(app.focus, Focus::Results);
+        assert_eq!(app.results_text, "No server connected.");
+    }
+
+    #[test]
+    fn modal_cancel_restores_original_focus() {
+        let mut app = test_app();
+        app.focus_query_panel();
+        app.open_modal(AppMode::ServerSelect);
+
+        handle_server_select_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.focus, Focus::Query);
+    }
+
+    #[test]
+    fn server_switch_closes_modal_into_results_focus() {
+        let mut app = test_app();
+        app.focus_command_panel();
+        app.config.servers = vec![crate::client::ServerConfig {
+            name: "local".to_string(),
+            uri: "http://localhost".to_string(),
+            username: "admin".to_string(),
+            password: "admin".to_string(),
+            port: 8003,
+        }];
+        app.server_list = vec!["local - http://localhost".to_string()];
+        app.server_list_state.select(Some(0));
+        app.open_modal(AppMode::ServerSelect);
+
+        handle_server_select_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.focus, Focus::Results);
     }
 
     #[test]
@@ -3092,9 +4341,247 @@ mod tests {
         );
         assert_eq!(app.query_results_state.selected(), Some(0));
     }
+
+    #[test]
+    fn status_identity_spans_excludes_collection_and_uses_gray() {
+        let mut app = test_app();
+        app.config.active_server = Some("dockerlocal".to_string());
+        app.config.active_database = Some("Documents".to_string());
+        app.current_collection = Some("/test/retention/set/r".to_string());
+
+        let spans = app.status_identity_spans();
+        assert_eq!(spans.len(), 4);
+
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains("/test/retention/set/r"),
+            "collection should not appear in identity spans"
+        );
+
+        let gray = Style::default().fg(Color::DarkGray);
+        for span in &spans {
+            assert_eq!(span.style, gray, "identity spans should be gray");
+        }
+    }
+
+    #[test]
+    fn status_line_excludes_collection_and_status_message() {
+        let mut app = test_app();
+        app.config.active_server = Some("dockerlocal".to_string());
+        app.config.active_database = Some("Documents".to_string());
+        app.current_collection = Some("/test/retention/set/r".to_string());
+        app.status_message = "Something happened".to_string();
+
+        let line = app.status_line();
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        assert!(text.contains("NORMAL"), "mode should appear");
+        assert!(text.contains("dockerlocal"), "server should appear");
+        assert!(text.contains("Documents"), "database should appear");
+        assert!(
+            !text.contains("/test/retention/set/r"),
+            "collection should not appear"
+        );
+        assert!(
+            !text.contains("Something happened"),
+            "status message should not appear"
+        );
+    }
+
+    #[test]
+    fn status_line_stops_at_database() {
+        let mut app = test_app();
+        app.config.active_server = Some("srv".to_string());
+        app.config.active_database = Some("db".to_string());
+
+        let line = app.status_line();
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        // Expected: "  NORMAL · srv · db"
+        assert!(text.starts_with("  NORMAL"));
+        assert!(text.ends_with("db"));
+        let parts: Vec<&str> = text.split(" · ").collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "should be exactly 3 parts: mode, server, database"
+        );
+    }
+
+    #[test]
+    fn fullscreen_e_triggers_editor_when_document_active() {
+        let mut app = test_app();
+        app.mode = AppMode::FullScreenView;
+        app.active_document = Some(crate::client::DocumentDetail {
+            uri: "/test/doc.xml".to_string(),
+            content: "<root/>".to_string(),
+            collections: vec![],
+            permissions: vec![],
+            quality: None,
+        });
+
+        // Ensure $EDITOR is unset so the test does not launch a real editor.
+        let old_editor = std::env::var_os("EDITOR");
+        unsafe { std::env::remove_var("EDITOR") };
+
+        handle_fullscreen_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        // Restore $EDITOR in case other tests rely on it.
+        if let Some(val) = old_editor {
+            unsafe { std::env::set_var("EDITOR", val) };
+        }
+
+        // open_document_in_external_editor always sets this flag, even on error.
+        assert!(
+            app.needs_terminal_refresh,
+            "external editor should set refresh flag"
+        );
+    }
+
+    #[test]
+    fn fullscreen_e_edits_content_without_active_document() {
+        let mut app = test_app();
+        app.mode = AppMode::FullScreenView;
+        app.active_document = None;
+        app.full_view_content = "test content".to_string();
+
+        let old_editor = std::env::var_os("EDITOR");
+        unsafe { std::env::remove_var("EDITOR") };
+
+        handle_fullscreen_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        if let Some(val) = old_editor {
+            unsafe { std::env::set_var("EDITOR", val) };
+        }
+
+        assert!(
+            app.needs_terminal_refresh,
+            "e should open editor even without active_document"
+        );
+    }
+
+    #[test]
+    fn fullscreen_question_opens_help_overlay() {
+        let mut app = test_app();
+        app.mode = AppMode::FullScreenView;
+
+        handle_fullscreen_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::HelpOverlay);
+        assert_eq!(app.previous_mode, Some(AppMode::FullScreenView));
+    }
+
+    #[test]
+    fn fullscreen_ctrl_e_no_longer_edits() {
+        let mut app = test_app();
+        app.mode = AppMode::FullScreenView;
+        app.active_document = Some(crate::client::DocumentDetail {
+            uri: "/test/doc.xml".to_string(),
+            content: "<root/>".to_string(),
+            collections: vec![],
+            permissions: vec![],
+            quality: None,
+        });
+
+        handle_fullscreen_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+
+        assert!(
+            !app.needs_terminal_refresh,
+            "Ctrl+E should no longer trigger editor"
+        );
+    }
+
+    #[test]
+    fn query_panel_e_opens_editor_in_navigate_mode() {
+        let mut app = test_app();
+        app.focus = Focus::Query;
+        app.edit_mode = EditMode::Navigate;
+        app.query_editor = App::new_query_editor(vec!["test content".to_string()]);
+
+        let old_editor = std::env::var_os("EDITOR");
+        unsafe { std::env::remove_var("EDITOR") };
+
+        handle_query_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+
+        if let Some(val) = old_editor {
+            unsafe { std::env::set_var("EDITOR", val) };
+        }
+
+        assert!(
+            app.needs_terminal_refresh,
+            "e in navigate mode should open external editor"
+        );
+    }
+
+    #[test]
+    fn query_panel_e_does_not_open_editor_in_insert_mode() {
+        let mut app = test_app();
+        app.focus = Focus::Query;
+        app.edit_mode = EditMode::Insert;
+        app.query_editor = App::new_query_editor(vec!["test content".to_string()]);
+
+        handle_query_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+
+        assert!(
+            !app.needs_terminal_refresh,
+            "e in insert mode should type letter, not open editor"
+        );
+        let text: String = app.query_editor.lines().join("\n");
+        assert!(text.contains('e'), "e should be inserted in insert mode");
+    }
+
+    #[test]
+    fn query_results_fullscreen_e_edits_content() {
+        let mut app = test_app();
+        app.mode = AppMode::FullScreenView;
+        app.active_document = None;
+        app.full_view_content = "query result content".to_string();
+
+        let old_editor = std::env::var_os("EDITOR");
+        unsafe { std::env::remove_var("EDITOR") };
+
+        handle_fullscreen_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        if let Some(val) = old_editor {
+            unsafe { std::env::set_var("EDITOR", val) };
+        }
+
+        assert!(
+            app.needs_terminal_refresh,
+            "e should open editor for query results fullscreen"
+        );
+    }
 }
 
 fn handle_command_key(app: &mut App, key: KeyEvent) {
+    let is_start_page = app.mode == AppMode::StartPage;
+
     match key.code {
         KeyCode::Enter => {
             if !app.autocomplete_suggestions.is_empty() && app.command_input.starts_with(':') {
@@ -3117,7 +4604,9 @@ fn handle_command_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab => {
             if app.command_input.is_empty() {
-                app.cycle_panel_focus();
+                if !is_start_page {
+                    app.cycle_panel_focus();
+                }
                 return;
             }
             // Accept the current suggestion into the input
@@ -3133,7 +4622,9 @@ fn handle_command_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::BackTab => {
             if app.command_input.is_empty() {
-                app.cycle_panel_focus_backward();
+                if !is_start_page {
+                    app.cycle_panel_focus_backward();
+                }
                 return;
             }
             if !app.autocomplete_suggestions.is_empty() {
@@ -3160,7 +4651,12 @@ fn handle_command_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Esc => {
+            app.command_input.clear();
             app.autocomplete_suggestions.clear();
+            app.autocomplete_selected = 0;
+            if !is_start_page {
+                app.cycle_panel_focus();
+            }
         }
         KeyCode::Backspace => {
             app.command_input.pop();
@@ -3168,7 +4664,7 @@ fn handle_command_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char(c) => {
             // '/' as first character switches to filter mode
-            if c == '/' && app.command_input.is_empty() {
+            if c == '/' && app.command_input.is_empty() && !is_start_page {
                 app.open_filter_input();
                 return;
             }
@@ -3340,9 +4836,6 @@ fn handle_results_key(app: &mut App, key: KeyEvent) {
                 app.focus_query_panel();
             }
         }
-        KeyCode::BackTab => {
-            app.focus_command_panel();
-        }
         KeyCode::Char('n') => {
             if !is_query_results {
                 let max_page = app
@@ -3370,7 +4863,7 @@ fn handle_results_key(app: &mut App, key: KeyEvent) {
 fn handle_database_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Esc => {
-            app.mode = AppMode::Normal;
+            app.close_modal_restore_focus();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(sel) = app.database_list_state.selected() {
@@ -3396,7 +4889,7 @@ fn handle_database_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                         c.set_database(db_name.clone());
                     }
                     app.status_message = format!("Database: {}", db_name);
-                    app.mode = AppMode::Normal;
+                    app.close_modal_with_focus(Focus::Results);
                     app.current_collection = None;
                     app.current_page = 0;
                     app.fetch_list();
@@ -3411,7 +4904,7 @@ fn handle_database_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 fn handle_collection_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Esc => {
-            app.mode = AppMode::Normal;
+            app.close_modal_restore_focus();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(sel) = app.collection_list_state.selected() {
@@ -3432,7 +4925,7 @@ fn handle_collection_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 if let Some(col) = app.collection_list.get(sel) {
                     app.current_collection = Some(col.clone());
                     app.current_page = 0;
-                    app.mode = AppMode::Normal;
+                    app.close_modal_with_focus(Focus::Results);
                     app.fetch_list();
                 }
             }
@@ -3445,7 +4938,7 @@ fn handle_collection_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 fn handle_query_file_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Esc => {
-            app.mode = AppMode::Normal;
+            app.close_modal_restore_focus();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(sel) = app.query_file_list_state.selected() {
@@ -3464,7 +4957,7 @@ fn handle_query_file_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Enter => {
             if let Some(sel) = app.query_file_list_state.selected() {
                 if let Some(path) = app.query_files.get(sel).cloned() {
-                    app.mode = AppMode::Normal;
+                    app.close_modal_with_focus(Focus::Query);
                     app.select_query_file(path);
                 }
             }
@@ -3474,10 +4967,96 @@ fn handle_query_file_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
+fn handle_tracked_folder_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.close_modal_restore_focus();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_tracked_folder_selection(-1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_tracked_folder_selection(1);
+        }
+        KeyCode::Char('g') => {
+            app.tracked_folder_list_state
+                .select(app.first_tracked_folder_item_index());
+        }
+        KeyCode::Char('G') => {
+            app.tracked_folder_list_state
+                .select(app.last_tracked_folder_item_index());
+        }
+        KeyCode::Enter => {
+            app.switch_to_selected_tracked_folder();
+        }
+        KeyCode::Char('a') => {
+            app.open_tracked_folder_add();
+        }
+        KeyCode::Char('f') => {
+            app.toggle_selected_tracked_folder_favorite();
+        }
+        KeyCode::Char('d') => {
+            app.start_delete_selected_tracked_folder();
+        }
+        KeyCode::Char('c') => {
+            app.start_clear_selected_tracked_folder_cache();
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_tracked_folder_add_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.open_modal(AppMode::TrackedFolderSelect);
+        }
+        KeyCode::Enter => {
+            app.add_tracked_folder_from_input();
+        }
+        KeyCode::Backspace => {
+            app.tracked_folder_input.pop();
+        }
+        KeyCode::Char(c) => {
+            app.tracked_folder_input.push(c);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_tracked_folder_delete_confirm_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.confirm_delete_selected_tracked_folder();
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.tracked_folder_delete_target = None;
+            app.mode = AppMode::TrackedFolderSelect;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_tracked_folder_cache_clear_confirm_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.confirm_clear_selected_tracked_folder_cache();
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.tracked_folder_cache_clear_target = None;
+            app.mode = AppMode::TrackedFolderSelect;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 fn handle_query_file_create_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Esc => {
-            app.mode = AppMode::Normal;
+            app.close_modal_restore_focus();
         }
         KeyCode::Enter => {
             app.create_new_query_file_from_input();
@@ -3499,7 +5078,7 @@ fn handle_delete_confirm_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             app.confirm_delete();
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            app.mode = AppMode::Normal;
+            app.close_modal_restore_focus();
         }
         _ => {}
     }
@@ -3520,7 +5099,11 @@ fn handle_fullscreen_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.mode = AppMode::Normal;
         }
-        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('?') if key.modifiers.is_empty() => {
+            app.previous_mode = Some(app.mode.clone());
+            app.mode = AppMode::HelpOverlay;
+        }
+        KeyCode::Char('e') if key.modifiers.is_empty() => {
             app.open_document_in_external_editor();
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -3562,7 +5145,7 @@ fn handle_fullscreen_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 fn handle_server_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Esc => {
-            app.mode = AppMode::Normal;
+            app.close_modal_restore_focus();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(sel) = app.server_list_state.selected() {
@@ -3585,8 +5168,11 @@ fn handle_server_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                     app.config.active_server = Some(name.clone());
                     app.config.save().ok();
                     app.reconnect();
-                    app.mode = AppMode::Normal;
+                    app.close_modal_with_focus(Focus::Results);
                     app.status_message = format!("Switched to server: {}", name);
+                    app.current_collection = None;
+                    app.current_page = 0;
+                    app.fetch_list();
                 }
             }
         }
@@ -3603,7 +5189,7 @@ fn handle_server_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                     app.reconnect();
                     app.cmd_servers();
                     if app.server_list.is_empty() {
-                        app.mode = AppMode::Normal;
+                        app.close_modal_with_focus(Focus::Results);
                     }
                 }
             }
@@ -3616,8 +5202,7 @@ fn handle_server_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 fn handle_server_add_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Esc => {
-            app.mode = AppMode::ServerSelect;
-            app.cmd_servers();
+            app.open_modal(AppMode::ServerSelect);
         }
         KeyCode::Enter => {
             // Submit the form
@@ -3665,7 +5250,7 @@ fn handle_server_add_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 fn handle_query_file_rename_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Esc => {
-            app.mode = AppMode::Normal;
+            app.close_modal_restore_focus();
             app.rename_file_target = None;
         }
         KeyCode::Enter => {
@@ -3688,11 +5273,11 @@ fn handle_query_file_delete_confirm_key(app: &mut App, key: KeyEvent) -> Result<
             if let Some(path) = app.file_delete_target.take() {
                 app.delete_query_file(path);
             }
-            app.mode = AppMode::Normal;
+            app.close_modal_with_focus(Focus::Query);
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             app.file_delete_target = None;
-            app.mode = AppMode::Normal;
+            app.close_modal_restore_focus();
         }
         _ => {}
     }
