@@ -114,9 +114,15 @@ fn format_xml(xml: &str) -> String {
 }
 
 pub(crate) fn ui(f: &mut Frame, app: &mut App) {
+    f.render_widget(
+        Block::default().style(Style::default().bg(app_background_color())),
+        f.area(),
+    );
+
     match app.mode {
         AppMode::StartPage => ui_start_page(f, app),
         AppMode::FullScreenView => ui_fullscreen(f, app),
+        AppMode::LogViewer => ui_log_viewer(f, app),
         AppMode::Interface(AppInterface::Servers) => ui_servers_interface(f, app),
         AppMode::ServerForm => ui_server_form(f, app),
         AppMode::ServerDeleteConfirm => ui_server_delete_confirm(f, app),
@@ -126,13 +132,28 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         AppMode::QueryFileCreate => ui_query_file_create(f, app),
         AppMode::QueryFileRename => ui_query_file_rename(f, app),
         AppMode::QueryFileDeleteConfirm => ui_query_file_delete_confirm(f, app),
+        AppMode::ModuleCloneSelect => ui_module_clone_select(f, app),
         AppMode::TrackedFolderSelect => ui_tracked_folder_select(f, app),
         AppMode::TrackedFolderAdd => ui_tracked_folder_add(f, app),
         AppMode::TrackedFolderDeleteConfirm => ui_tracked_folder_delete_confirm(f, app),
         AppMode::TrackedFolderCacheClearConfirm => ui_tracked_folder_cache_clear_confirm(f, app),
         AppMode::HelpOverlay => ui_help(f, app),
         AppMode::Normal => ui_normal(f, app),
+        AppMode::DocumentCreate => ui_document_create(f, app),
+        AppMode::DocumentMetadataEdit => ui_document_metadata_edit(f, app),
     }
+}
+
+fn app_background_color() -> Color {
+    Color::Rgb(6, 12, 28)
+}
+
+fn menu_bar_background_color() -> Color {
+    Color::Rgb(160, 150, 110)
+}
+
+fn menu_bar_text_color() -> Color {
+    Color::Rgb(6, 12, 28)
 }
 
 fn panel_block<T>(title: T, shortcut: &'static str) -> Block<'static>
@@ -187,6 +208,15 @@ pub(crate) fn resolve_folder_input(current_root: &Path, input: &str) -> PathBuf 
     }
 }
 
+fn command_indent_level(cmd: &str) -> usize {
+    match cmd {
+        ":server-add" | ":databases" => 1,
+        ":collections" | ":list:<collection>" | ":clear" => 1,
+        ":query-files" | ":query-open" | ":folders" => 1,
+        _ => 0,
+    }
+}
+
 fn keybinding_items(
     focus: &Focus,
     edit_mode: &EditMode,
@@ -207,6 +237,7 @@ fn keybinding_items(
             } else {
                 items.push(("i", "Insert"));
                 items.push(("r", "Run"));
+                items.push(("c", "Clone"));
                 items.push(("e", "Editor"));
                 items.push(("n", "New"));
                 if file_list_visible {
@@ -219,6 +250,7 @@ fn keybinding_items(
             items.push(("Space", "Select"));
             items.push(("n/p", "Page"));
             items.push(("/", "Filter"));
+            items.push(("c", "Create"));
             items.push(("^D", "Delete"));
         }
         Focus::Filter => {
@@ -233,10 +265,10 @@ fn keybinding_items(
 fn keybindings_line(focus: &Focus, edit_mode: &EditMode, file_list_visible: bool) -> Line<'static> {
     let items = keybinding_items(focus, edit_mode, file_list_visible);
     let key_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(Color::White)
         .add_modifier(Modifier::BOLD);
-    let label_style = Style::default().fg(Color::Gray);
-    let divider_style = Style::default().fg(Color::DarkGray);
+    let label_style = Style::default().fg(Color::Rgb(60, 60, 60));
+    let divider_style = Style::default().fg(Color::Rgb(100, 100, 100));
 
     let mut spans = Vec::new();
     for (i, (key, label)) in items.into_iter().enumerate() {
@@ -247,6 +279,38 @@ fn keybindings_line(focus: &Focus, edit_mode: &EditMode, file_list_visible: bool
         spans.push(Span::styled(format!(" {}", label), label_style));
     }
 
+    Line::from(spans)
+}
+
+fn styled_menu_bar_items(items: &[String]) -> Line<'static> {
+    let white_key = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::Rgb(60, 60, 60));
+    let sep_style = Style::default().fg(Color::Rgb(100, 100, 100));
+
+    let mut spans = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" | ", sep_style));
+        }
+
+        let item = item.trim();
+        if let Some((keys_part, desc)) = item.split_once(": ") {
+            let keys: Vec<&str> = keys_part.split('/').collect();
+            for (j, key) in keys.iter().enumerate() {
+                if j > 0 {
+                    spans.push(Span::styled("/", sep_style));
+                }
+                spans.push(Span::styled(key.to_string(), white_key));
+            }
+            spans.push(Span::styled(format!(": {}", desc), desc_style));
+        } else if let Some(pos) = item.find(' ') {
+            let (key, desc) = item.split_at(pos);
+            spans.push(Span::styled(key.to_string(), white_key));
+            spans.push(Span::styled(desc.to_string(), desc_style));
+        } else {
+            spans.push(Span::styled(item.to_string(), white_key));
+        }
+    }
     Line::from(spans)
 }
 
@@ -261,7 +325,7 @@ fn ui_start_page(f: &mut Frame, app: &mut App) {
         prompt_width = area.width.max(1);
     }
 
-    let prompt_height = 4;
+    let prompt_height = 3;
 
     let prompt_area = Rect {
         x: area.x + area.width.saturating_sub(prompt_width) / 2,
@@ -270,15 +334,54 @@ fn ui_start_page(f: &mut Frame, app: &mut App) {
         height: prompt_height,
     };
 
+    let server = app
+        .config
+        .active_server
+        .as_deref()
+        .unwrap_or("(no server)");
+    let port = app
+        .config
+        .active_server_config()
+        .map(|s| s.port.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let database = app
+        .config
+        .active_database
+        .as_deref()
+        .unwrap_or("(no database)");
+
+    let connection_height = 3;
+    let server_line = format!("{:<10}{}", "Server:", server);
+    let port_line = format!("{:<10}{}", "Port:", port);
+    let database_line = format!("{:<10}{}", "Database:", database);
+    let content_width = [server_line.len(), port_line.len(), database_line.len()]
+        .into_iter()
+        .max()
+        .unwrap_or(1) as u16;
+    let max_connection_width = area.width.saturating_sub(2).max(1);
+    let connection_width = content_width.saturating_add(2).min(max_connection_width);
+    let connection_area = Rect {
+        x: area.x + area.width.saturating_sub(connection_width) / 2,
+        y: prompt_area
+            .y
+            .saturating_sub(connection_height)
+            .saturating_sub(1),
+        width: connection_width,
+        height: connection_height,
+    };
+
     let bottom_y = area.y + area.height.saturating_sub(1);
-    let title_y = prompt_area.y.saturating_sub(2);
+    let title_y = connection_area.y.saturating_sub(2);
     let footer_y = prompt_area
         .y
         .saturating_add(prompt_area.height)
         .saturating_add(1)
         .min(bottom_y);
 
-    let title = Paragraph::new(format!("MARKLOGIC TUI v{}", env!("CARGO_PKG_VERSION")))
+    let title = Paragraph::new(format!(
+        "M A R K L O G I C   T U I   (v{})",
+        env!("CARGO_PKG_VERSION")
+    ))
         .alignment(Alignment::Center)
         .style(
             Style::default()
@@ -295,8 +398,30 @@ fn ui_start_page(f: &mut Frame, app: &mut App) {
         },
     );
 
+    let label_style = Style::default().fg(Color::Gray);
+    let server_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let port_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let database_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let connection_lines = vec![
+        Line::from(vec![
+            Span::styled(format!("{:<10}", "Server:"), label_style),
+            Span::styled(server.to_string(), server_style),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("{:<10}", "Port:"), label_style),
+            Span::styled(port, port_style),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("{:<10}", "Database:"), label_style),
+            Span::styled(database.to_string(), database_style),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(connection_lines), connection_area);
+
     let footer_text = if app.status_message.is_empty() {
-        "Press '?' for help on any screen"
+        "Type ':' for a list of commands or '?' for help on any screen"
     } else {
         app.status_message.as_str()
     };
@@ -363,23 +488,6 @@ fn ui_start_page(f: &mut Frame, app: &mut App) {
         },
     );
 
-    let mut status_spans = vec![
-        Span::styled(bar_glyph, bar_style),
-        Span::raw(" "),
-        Span::styled(app.edit_mode_label(), app.start_page_mode_style()),
-    ];
-    status_spans.extend(app.status_identity_spans());
-    let status_line = Line::from(status_spans);
-    f.render_widget(
-        Paragraph::new(status_line).style(command_style),
-        Rect {
-            x: prompt_area.x,
-            y: prompt_area.y.saturating_add(3),
-            width: prompt_area.width,
-            height: 1,
-        },
-    );
-
     if app.focus == Focus::Command {
         let cursor_offset =
             (command_input.chars().count() as u16 + 2).min(prompt_area.width.saturating_sub(1));
@@ -398,7 +506,9 @@ fn ui_start_page(f: &mut Frame, app: &mut App) {
                     .find(|(c, _)| *c == cmd)
                     .map(|(_, d)| *d)
                     .unwrap_or("");
-                let text = format!(" {} - {}", cmd, desc);
+                let indent = command_indent_level(cmd);
+                let indent_str = "  ".repeat(indent);
+                let text = format!("{}{} - {}", indent_str, cmd, desc);
                 let style = if i == app.autocomplete_selected {
                     Style::default().bg(Color::DarkGray).fg(Color::White)
                 } else {
@@ -465,10 +575,15 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[0]);
-    let status = Paragraph::new(app.status_line());
+    let menu_bar_style = Style::default()
+        .bg(menu_bar_background_color())
+        .fg(menu_bar_text_color());
+    let status = Paragraph::new(app.status_line()).style(menu_bar_style);
     f.render_widget(status, top_chunks[0]);
     let kb_line = keybindings_line(&app.focus, &app.edit_mode, app.file_list_visible);
-    let kb_bar = Paragraph::new(kb_line).alignment(Alignment::Right);
+    let kb_bar = Paragraph::new(kb_line)
+        .alignment(Alignment::Right)
+        .style(menu_bar_style);
     f.render_widget(kb_bar, top_chunks[1]);
 
     // Content area: query on top (if visible), results on bottom
@@ -554,9 +669,9 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::DarkGray)
         };
         let editor_bg = if app.edit_mode == EditMode::Insert {
-            Color::Black
+            Color::Rgb(0, 0, 0)
         } else {
-            Color::Rgb(35, 35, 35)
+            app_background_color()
         };
         let query_block = if should_show_file_list {
             let title_line = Line::from(vec![Span::raw("[1]─ "), Span::raw(app.query_title())]);
@@ -621,7 +736,7 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
                         .borders(Borders::TOP | Borders::RIGHT | Borders::BOTTOM)
                         .title("Files [f=folders]")
                         .border_style(file_list_style)
-                        .style(Style::default().bg(Color::Black)),
+                        .style(Style::default().bg(Color::Rgb(10, 18, 42))),
                 )
                 .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
                 .highlight_symbol("> ");
@@ -753,7 +868,9 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
                     .find(|(c, _)| *c == cmd)
                     .map(|(_, d)| *d)
                     .unwrap_or("");
-                let text = format!(" {} - {}", cmd, desc);
+                let indent = command_indent_level(cmd);
+                let indent_str = "  ".repeat(indent);
+                let text = format!("{}{} - {}", indent_str, cmd, desc);
                 let style = if i == app.autocomplete_selected {
                     Style::default().bg(Color::DarkGray).fg(Color::White)
                 } else {
@@ -798,20 +915,26 @@ fn ui_fullscreen(f: &mut Frame, app: &mut App) {
     };
     app.fullscreen_area_height = chunks[1].height;
 
-    let status = Paragraph::new(app.status_line());
-    f.render_widget(status, top_chunks[0]);
+    let menu_bar_style = Style::default()
+        .bg(menu_bar_background_color())
+        .fg(menu_bar_text_color());
+    f.render_widget(
+        Paragraph::new(app.status_line()).style(menu_bar_style),
+        top_chunks[0],
+    );
 
-    let mut kb_parts = vec![
+    let mut kb_items = vec![
         "Close: Esc/q".to_string(),
         "j/k: scroll".to_string(),
         "d/u: page".to_string(),
         "gg/G: top/bottom".to_string(),
-        "e: edit".to_string(),
+        "e: edit ext".to_string(),
+        "m: edit doc".to_string(),
         "?: help".to_string(),
     ];
-    kb_parts.push(format!("{}%", pct));
-    let kb_bar = Paragraph::new(kb_parts.join(" | "))
-        .style(Style::default().fg(Color::Cyan))
+    kb_items.push(format!("{}%", pct));
+    let kb_bar = Paragraph::new(styled_menu_bar_items(&kb_items))
+        .style(menu_bar_style)
         .alignment(Alignment::Right);
     f.render_widget(kb_bar, top_chunks[1]);
 
@@ -822,6 +945,62 @@ fn ui_fullscreen(f: &mut Frame, app: &mut App) {
         .block(block)
         .wrap(Wrap { trim: false })
         .scroll((app.full_view_scroll, 0));
+    f.render_widget(para, chunks[1]);
+}
+
+fn ui_log_viewer(f: &mut Frame, app: &mut App) {
+    app.refresh_log_viewer_content();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(f.area());
+
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[0]);
+
+    let total_lines = app.log_view_content.lines().count() as u16;
+    let content_height = chunks[1].height.saturating_sub(2);
+    let max_scroll = total_lines.saturating_sub(content_height);
+    app.log_view_scroll = app.log_view_scroll.min(max_scroll);
+    let pct = if max_scroll == 0 {
+        100
+    } else {
+        ((app.log_view_scroll as f32 / max_scroll as f32) * 100.0) as u16
+    };
+    app.log_viewer_area_height = chunks[1].height;
+
+    let menu_bar_style = Style::default()
+        .bg(menu_bar_background_color())
+        .fg(menu_bar_text_color());
+    f.render_widget(
+        Paragraph::new(app.status_line()).style(menu_bar_style),
+        top_chunks[0],
+    );
+
+    let mut kb_items = vec![
+        "Close: Esc/q".to_string(),
+        "j/k: scroll".to_string(),
+        "d/u: page".to_string(),
+        "gg/G: top/bottom".to_string(),
+        "e: edit ext".to_string(),
+        "?: help".to_string(),
+    ];
+    kb_items.push(format!("{}%", pct));
+    let kb_bar = Paragraph::new(styled_menu_bar_items(&kb_items))
+        .style(menu_bar_style)
+        .alignment(Alignment::Right);
+    f.render_widget(kb_bar, top_chunks[1]);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("Application Log [{}]", app.log_file_path.display()));
+    let para = Paragraph::new(app.log_view_content.as_str())
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((app.log_view_scroll, 0));
     f.render_widget(para, chunks[1]);
 }
 
@@ -934,6 +1113,42 @@ fn ui_query_file_delete_confirm(f: &mut Frame, app: &App) {
         )
         .wrap(Wrap { trim: false });
     f.render_widget(para, area);
+}
+
+fn ui_module_clone_select(f: &mut Frame, app: &mut App) {
+    let area = centered_rect(90, 90, f.area());
+    f.render_widget(Clear, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    let filter = Paragraph::new(app.module_clone_filter_input.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Clone Filter (type to search module URI)"),
+    );
+    f.render_widget(filter, rows[0]);
+
+    let items: Vec<ListItem> = app
+        .module_clone_filtered_uris
+        .iter()
+        .map(|uri| ListItem::new(format!("  {}", uri)))
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Modules [Tab/j/k move, Enter clone, Esc cancel]"),
+        )
+        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, rows[1], &mut app.module_clone_list_state);
+
+    let cursor_x = rows[0].x + app.module_clone_filter_input.chars().count() as u16 + 1;
+    f.set_cursor_position((cursor_x, rows[0].y + 1));
 }
 
 fn ui_tracked_folder_select(f: &mut Frame, app: &mut App) {
@@ -1086,13 +1301,26 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[0]);
 
-    f.render_widget(Paragraph::new(app.status_line()), top_chunks[0]);
+    let menu_bar_style = Style::default()
+        .bg(menu_bar_background_color())
+        .fg(menu_bar_text_color());
     f.render_widget(
-        Paragraph::new(
-            "Tab focus | Enter activate | a add | e edit | d remove | r refresh dbs | q/Esc close",
-        )
-        .style(Style::default().fg(Color::Cyan))
-        .alignment(Alignment::Right),
+        Paragraph::new(app.status_line()).style(menu_bar_style),
+        top_chunks[0],
+    );
+    let servers_kb_items = vec![
+        "Tab focus".to_string(),
+        "Enter activate".to_string(),
+        "a add".to_string(),
+        "e edit".to_string(),
+        "d remove".to_string(),
+        "r refresh dbs/app-servers".to_string(),
+        "q/Esc close".to_string(),
+    ];
+    f.render_widget(
+        Paragraph::new(styled_menu_bar_items(&servers_kb_items))
+            .style(menu_bar_style)
+            .alignment(Alignment::Right),
         top_chunks[1],
     );
 
@@ -1147,6 +1375,42 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
             .collect()
     };
 
+    let app_server_items: Vec<ListItem> = if app.app_server_list.is_empty() {
+        vec![ListItem::new("  No app servers loaded")]
+    } else {
+        app.app_server_list
+            .iter()
+            .map(|app_server| {
+                let marker = if app.config.active_app_server.as_deref() == Some(app_server.name.as_str()) {
+                    " (active)"
+                } else {
+                    ""
+                };
+                let content = app_server
+                    .content_database
+                    .as_deref()
+                    .unwrap_or("(no content db)");
+                let modules = app_server
+                    .modules_database
+                    .as_deref()
+                    .unwrap_or("(no modules db)");
+                ListItem::new(format!(
+                    "  {}{} · :{} · content={} · modules={}",
+                    app_server.name,
+                    marker,
+                    app_server.port,
+                    content,
+                    modules
+                ))
+            })
+            .collect()
+    };
+
+    let db_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(body[1]);
+
     let databases = List::new(database_items)
         .block(
             Block::default()
@@ -1162,7 +1426,24 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         )
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol("> ");
-    f.render_stateful_widget(databases, body[1], &mut app.database_list_state);
+    f.render_stateful_widget(databases, db_chunks[0], &mut app.database_list_state);
+
+    let app_servers = List::new(app_server_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("App Servers [Enter=select, r=refresh]")
+                .border_style(
+                    if app.servers_interface_focus == ServersInterfaceFocus::AppServers {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+        )
+        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(app_servers, db_chunks[1], &mut app.app_server_list_state);
 
     let detail = if app.config.servers.is_empty() {
         vec![
@@ -1213,14 +1494,34 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
                             .to_string(),
                     ),
                 ]),
+                Line::from(vec![
+                    Span::styled("Modules DB: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(
+                        app.config
+                            .active_modules_database
+                            .as_deref()
+                            .unwrap_or("(no modules db)")
+                            .to_string(),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("App Server: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(
+                        app.config
+                            .active_app_server
+                            .as_deref()
+                            .unwrap_or("(none)")
+                            .to_string(),
+                    ),
+                ]),
                 Line::from(""),
                 Line::from("Shortcuts"),
-                Line::from("  Tab    Switch server/database focus"),
-                Line::from("  Enter  Activate selected server or database"),
+                Line::from("  Tab    Switch server/database/app-server focus"),
+                Line::from("  Enter  Activate selected server/database/app-server"),
                 Line::from("  a      Add a server"),
                 Line::from("  e      Edit selected server"),
                 Line::from("  d      Remove selected server"),
-                Line::from("  r      Refresh databases"),
+                Line::from("  r      Refresh databases/app-servers"),
                 Line::from("  q/Esc  Close interface"),
             ]
         } else {
@@ -1253,6 +1554,7 @@ fn ui_server_form(f: &mut Frame, app: &App) {
         "Username",
         "Password",
         "Port (default 8003)",
+        "Auth Type",
     ];
     let area = centered_rect(60, 50, f.area());
     f.render_widget(Clear, area);
@@ -1309,6 +1611,124 @@ fn ui_server_form(f: &mut Frame, app: &App) {
     ));
 }
 
+fn ui_document_create(f: &mut Frame, app: &App) {
+    let labels = ["URI", "Collections (comma separated)", "Quality", "Content"];
+    let area = f.area();
+    f.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    for (i, label) in labels.iter().enumerate() {
+        let style = if i == app.doc_form_step {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let display = match i {
+            0 => app.doc_form_uri.clone(),
+            1 => app.doc_form_collections.clone(),
+            2 => app.doc_form_quality.clone(),
+            3 => app.doc_form_content.clone(),
+            _ => String::new(),
+        };
+        let p = Paragraph::new(display).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(*label)
+                .border_style(style),
+        );
+        f.render_widget(p, chunks[i]);
+    }
+
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Create Document [Tab fields, Enter save, Esc cancel]")
+            .border_style(Style::default().fg(Color::Cyan)),
+        area,
+    );
+
+    let field_area = chunks[app.doc_form_step];
+    let cursor_x = match app.doc_form_step {
+        0 => field_area.x + app.doc_form_uri.chars().count() as u16 + 1,
+        1 => field_area.x + app.doc_form_collections.chars().count() as u16 + 1,
+        2 => field_area.x + app.doc_form_quality.chars().count() as u16 + 1,
+        3 => field_area.x + app.doc_form_content.chars().count() as u16 + 1,
+        _ => field_area.x + 1,
+    };
+    f.set_cursor_position((
+        cursor_x.min(field_area.x + field_area.width.saturating_sub(2)),
+        field_area.y + 1,
+    ));
+}
+
+fn ui_document_metadata_edit(f: &mut Frame, app: &App) {
+    let labels = ["URI", "Collections (comma separated)", "Quality", "Content"];
+    let area = f.area();
+    f.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    for (i, label) in labels.iter().enumerate() {
+        let style = if i == app.doc_form_step {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let display = match i {
+            0 => app.doc_form_uri.clone(),
+            1 => app.doc_form_collections.clone(),
+            2 => app.doc_form_quality.clone(),
+            3 => app.doc_form_content.clone(),
+            _ => String::new(),
+        };
+        let p = Paragraph::new(display).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(*label)
+                .border_style(style),
+        );
+        f.render_widget(p, chunks[i]);
+    }
+
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Edit Document [Tab fields, Enter save, Esc cancel]")
+            .border_style(Style::default().fg(Color::Cyan)),
+        area,
+    );
+
+    let field_area = chunks[app.doc_form_step];
+    let cursor_x = match app.doc_form_step {
+        0 => field_area.x + app.doc_form_uri.chars().count() as u16 + 1,
+        1 => field_area.x + app.doc_form_collections.chars().count() as u16 + 1,
+        2 => field_area.x + app.doc_form_quality.chars().count() as u16 + 1,
+        3 => field_area.x + app.doc_form_content.chars().count() as u16 + 1,
+        _ => field_area.x + 1,
+    };
+    f.set_cursor_position((
+        cursor_x.min(field_area.x + field_area.width.saturating_sub(2)),
+        field_area.y + 1,
+    ));
+}
+
 fn ui_server_delete_confirm(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 20, f.area());
     f.render_widget(Clear, area);
@@ -1342,12 +1762,12 @@ fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode, mode: &AppMode) -> V
         return vec![
             "",
             "  Servers Interface",
-            "    Tab        Switch between servers and databases",
-            "    Enter      Activate selected server or database",
+            "    Tab        Switch between servers/databases/app-servers",
+            "    Enter      Activate selected server/database/app-server",
             "    a          Add server (server focus)",
             "    e          Edit selected server (server focus)",
             "    d          Remove selected server (server focus)",
-            "    r          Refresh databases (database focus)",
+            "    r          Refresh databases/app-servers",
             "    j/k        Move selection down/up",
             "    g/G        Go to top/bottom",
             "    q / Esc    Close servers interface",
@@ -1368,6 +1788,7 @@ fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode, mode: &AppMode) -> V
             "  Document View",
             "    Esc / q    Close document view",
             "    e          Edit in external editor",
+            "    m          Edit document (full-screen form)",
             "    j / k      Scroll down/up",
             "    d / u      Page down/up",
             "    g / G      Top/bottom",
@@ -1378,10 +1799,49 @@ fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode, mode: &AppMode) -> V
         ];
     }
 
+    if *mode == AppMode::LogViewer {
+        return vec![
+            "",
+            "  Log Viewer",
+            "    Esc / q    Close log viewer",
+            "    e          Open log in external editor",
+            "    j / k      Scroll down/up",
+            "    d / u      Page down/up",
+            "    g / G      Top/bottom",
+            "    Space      Page down",
+            "    PageUp     Page up",
+            "",
+            "  Press ? or Esc to close this help",
+        ];
+    }
+
+    if matches!(
+        mode,
+        AppMode::DocumentCreate | AppMode::DocumentMetadataEdit
+    ) {
+        return vec![
+            "",
+            "  Document Form",
+            "    Tab        Next field",
+            "    Backspace  Delete character",
+            "    Enter      Save document",
+            "    Esc        Cancel",
+            "",
+            "  Fields",
+            "    URI        Document URI (required)",
+            "    Collections  Comma-separated list",
+            "    Quality    Document quality (integer)",
+            "    Content    Document body",
+            "",
+            "  Press ? or Esc to close this help",
+        ];
+    }
+
     let mut lines = vec![
         "",
         "  Global",
         "    ?          Show/hide this help",
+        "    F2         Open application logs",
         "    :          Open command input",
         "    1          Focus query panel",
         "    2          Focus results panel",
@@ -1421,6 +1881,7 @@ fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode, mode: &AppMode) -> V
                     "    j/k        Navigate + auto-load file",
                     "    Enter      Load selected file",
                     "    f          Open tracked folders",
+                    "    c          Clone module",
                     "    n          New query file",
                     "    m          Rename selected file",
                     "    Delete     Delete selected file",
@@ -1442,6 +1903,7 @@ fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode, mode: &AppMode) -> V
                 "    n / p      Next/previous page",
                 "    Space      Toggle selection",
                 "    /          Filter results",
+                "    c          Create new document",
                 "    Ctrl+D     Delete selected",
                 "    g          Go to top (double-tap)",
                 "    G          Go to bottom",
