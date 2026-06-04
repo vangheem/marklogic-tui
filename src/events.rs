@@ -13,6 +13,11 @@ pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
                 return Ok(true);
             }
 
+            if key.code == KeyCode::F(2) && key.modifiers.is_empty() {
+                app.open_log_viewer();
+                return Ok(false);
+            }
+
             if handle_return_to_start_page_key(app, key)? {
                 return Ok(false);
             }
@@ -20,6 +25,7 @@ pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
             match app.mode {
                 AppMode::StartPage => {}
                 AppMode::FullScreenView => return handle_fullscreen_key(app, key),
+                AppMode::LogViewer => return handle_log_viewer_key(app, key),
                 AppMode::Interface(AppInterface::Servers) => {
                     return handle_servers_interface_key(app, key);
                 }
@@ -33,6 +39,7 @@ pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
                 AppMode::QueryFileDeleteConfirm => {
                     return handle_query_file_delete_confirm_key(app, key);
                 }
+                AppMode::ModuleCloneSelect => return handle_module_clone_select_key(app, key),
                 AppMode::TrackedFolderSelect => return handle_tracked_folder_select_key(app, key),
                 AppMode::TrackedFolderAdd => return handle_tracked_folder_add_key(app, key),
                 AppMode::TrackedFolderDeleteConfirm => {
@@ -40,6 +47,10 @@ pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
                 }
                 AppMode::TrackedFolderCacheClearConfirm => {
                     return handle_tracked_folder_cache_clear_confirm_key(app, key);
+                }
+                AppMode::DocumentCreate => return handle_document_create_key(app, key),
+                AppMode::DocumentMetadataEdit => {
+                    return handle_document_metadata_edit_key(app, key);
                 }
                 AppMode::HelpOverlay => {
                     if key.code == KeyCode::Char('?') || key.code == KeyCode::Esc {
@@ -273,6 +284,11 @@ pub(crate) fn handle_query_key(app: &mut App, key: KeyEvent) {
             || (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL))
         {
             app.execute_query();
+        } else if key.code == KeyCode::Char('c')
+            && key.modifiers.is_empty()
+            && app.edit_mode == EditMode::Navigate
+        {
+            app.open_module_clone_picker();
         } else if key.code == KeyCode::Char('\\') && key.modifiers.is_empty() {
             app.toggle_file_list();
         } else if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -331,6 +347,7 @@ pub(crate) fn handle_query_key(app: &mut App, key: KeyEvent) {
                     }
                 }
                 KeyCode::Char('e') => app.open_query_in_external_editor(),
+                KeyCode::Char('c') => app.open_module_clone_picker(),
                 KeyCode::Char('f') => app.open_tracked_folder_picker(),
                 KeyCode::Char('n') => app.open_query_file_create(),
                 KeyCode::Char('m') => app.start_rename_query_file(),
@@ -371,6 +388,7 @@ pub(crate) fn handle_query_key(app: &mut App, key: KeyEvent) {
             // Editor navigation mode (no file list visible)
             match key.code {
                 KeyCode::Char('e') => app.open_query_in_external_editor(),
+                KeyCode::Char('c') => app.open_module_clone_picker(),
                 KeyCode::Char('o') => app.open_query_file_picker(),
                 KeyCode::Char('n') => app.open_query_file_create(),
                 KeyCode::Char('r') => app.execute_query(),
@@ -675,6 +693,11 @@ pub(crate) fn handle_results_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
+        KeyCode::Char('c') if key.modifiers.is_empty() => {
+            if !is_query_results {
+                app.open_document_create();
+            }
+        }
         _ => {}
     }
 }
@@ -739,6 +762,39 @@ pub(crate) fn handle_query_file_select_key(app: &mut App, key: KeyEvent) -> Resu
                     app.select_query_file(path);
                 }
             }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_module_clone_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.close_modal_restore_focus();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_module_clone_selection(-1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_module_clone_selection(1);
+        }
+        KeyCode::Tab => {
+            app.move_module_clone_selection(1);
+        }
+        KeyCode::BackTab => {
+            app.move_module_clone_selection(-1);
+        }
+        KeyCode::Enter => {
+            app.clone_selected_module();
+        }
+        KeyCode::Backspace => {
+            app.module_clone_filter_input.pop();
+            app.rebuild_module_clone_filtered_uris();
+        }
+        KeyCode::Char(c) if key.modifiers.is_empty() => {
+            app.module_clone_filter_input.push(c);
+            app.rebuild_module_clone_filtered_uris();
         }
         _ => {}
     }
@@ -890,6 +946,9 @@ pub(crate) fn handle_fullscreen_key(app: &mut App, key: KeyEvent) -> Result<bool
         KeyCode::Char('e') if key.modifiers.is_empty() => {
             app.open_document_in_external_editor();
         }
+        KeyCode::Char('m') if key.modifiers.is_empty() => {
+            app.open_document_metadata_edit();
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             app.full_view_scroll = (app.full_view_scroll + 1).min(max_scroll);
         }
@@ -926,6 +985,61 @@ pub(crate) fn handle_fullscreen_key(app: &mut App, key: KeyEvent) -> Result<bool
     Ok(false)
 }
 
+pub(crate) fn handle_log_viewer_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let half_page = app.log_viewer_area_height.saturating_sub(2) / 2;
+    let max_scroll = app.log_viewer_max_scroll();
+
+    if key.code != KeyCode::Char('g') {
+        app.last_log_viewer_g = None;
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.close_log_viewer();
+        }
+        KeyCode::Char('?') if key.modifiers.is_empty() => {
+            app.previous_mode = Some(app.mode.clone());
+            app.mode = AppMode::HelpOverlay;
+        }
+        KeyCode::Char('e') if key.modifiers.is_empty() => {
+            app.open_log_in_external_editor();
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.log_view_scroll = (app.log_view_scroll + 1).min(max_scroll);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.log_view_scroll = app.log_view_scroll.saturating_sub(1);
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            app.log_view_scroll = (app.log_view_scroll + 20).min(max_scroll);
+        }
+        KeyCode::PageUp => {
+            app.log_view_scroll = app.log_view_scroll.saturating_sub(20);
+        }
+        KeyCode::Char('d') => {
+            app.log_view_scroll = (app.log_view_scroll + half_page.max(1)).min(max_scroll);
+        }
+        KeyCode::Char('u') => {
+            app.log_view_scroll = app.log_view_scroll.saturating_sub(half_page.max(1));
+        }
+        KeyCode::Char('G') => {
+            app.log_view_scroll = max_scroll;
+        }
+        KeyCode::Char('g') => {
+            if let Some(last_g) = app.last_log_viewer_g {
+                if last_g.elapsed().as_millis() < 500 {
+                    app.log_view_scroll = 0;
+                    app.last_log_viewer_g = None;
+                    return Ok(false);
+                }
+            }
+            app.last_log_viewer_g = Some(Instant::now());
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
@@ -934,16 +1048,19 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
         KeyCode::Tab => {
             app.servers_interface_focus = match app.servers_interface_focus {
                 ServersInterfaceFocus::Servers => ServersInterfaceFocus::Databases,
-                ServersInterfaceFocus::Databases => ServersInterfaceFocus::Servers,
+                ServersInterfaceFocus::Databases => ServersInterfaceFocus::AppServers,
+                ServersInterfaceFocus::AppServers => ServersInterfaceFocus::Servers,
             };
         }
         KeyCode::Up | KeyCode::Char('k') => match app.servers_interface_focus {
             ServersInterfaceFocus::Servers => app.move_server_selection(-1),
             ServersInterfaceFocus::Databases => app.move_database_selection(-1),
+            ServersInterfaceFocus::AppServers => app.move_app_server_selection(-1),
         },
         KeyCode::Down | KeyCode::Char('j') => match app.servers_interface_focus {
             ServersInterfaceFocus::Servers => app.move_server_selection(1),
             ServersInterfaceFocus::Databases => app.move_database_selection(1),
+            ServersInterfaceFocus::AppServers => app.move_app_server_selection(1),
         },
         KeyCode::Char('g') => match app.servers_interface_focus {
             ServersInterfaceFocus::Servers => {
@@ -954,6 +1071,11 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
             ServersInterfaceFocus::Databases => {
                 if !app.database_list.is_empty() {
                     app.database_list_state.select(Some(0));
+                }
+            }
+            ServersInterfaceFocus::AppServers => {
+                if !app.app_server_list.is_empty() {
+                    app.app_server_list_state.select(Some(0));
                 }
             }
         },
@@ -970,10 +1092,17 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
                         .select(Some(app.database_list.len().saturating_sub(1)));
                 }
             }
+            ServersInterfaceFocus::AppServers => {
+                if !app.app_server_list.is_empty() {
+                    app.app_server_list_state
+                        .select(Some(app.app_server_list.len().saturating_sub(1)));
+                }
+            }
         },
         KeyCode::Enter => match app.servers_interface_focus {
             ServersInterfaceFocus::Servers => app.activate_selected_server(),
             ServersInterfaceFocus::Databases => app.activate_selected_database(),
+            ServersInterfaceFocus::AppServers => app.activate_selected_app_server(),
         },
         KeyCode::Char('a') => {
             if app.servers_interface_focus == ServersInterfaceFocus::Servers {
@@ -991,8 +1120,10 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
             }
         }
         KeyCode::Char('r') => {
-            if app.servers_interface_focus == ServersInterfaceFocus::Databases {
-                app.refresh_database_list_for_interface();
+            if app.servers_interface_focus == ServersInterfaceFocus::Databases
+                || app.servers_interface_focus == ServersInterfaceFocus::AppServers
+            {
+                app.refresh_servers_interface_data();
             }
         }
         KeyCode::Char('?') if key.modifiers.is_empty() => {
@@ -1014,14 +1145,24 @@ pub(crate) fn handle_server_form_key(app: &mut App, key: KeyEvent) -> Result<boo
             app.submit_server_form();
         }
         KeyCode::Tab => {
-            app.server_form_step = (app.server_form_step + 1) % 5;
+            app.server_form_step = (app.server_form_step + 1) % 6;
         }
         KeyCode::BackTab => {
             app.server_form_step = if app.server_form_step == 0 {
-                4
+                5
             } else {
                 app.server_form_step - 1
             };
+        }
+        KeyCode::Up => {
+            if app.server_form_step == 5 {
+                app.cycle_auth_type_prev();
+            }
+        }
+        KeyCode::Down => {
+            if app.server_form_step == 5 {
+                app.cycle_auth_type_next();
+            }
         }
         KeyCode::Backspace => {
             app.server_form_fields[app.server_form_step].pop();
@@ -1080,6 +1221,72 @@ pub(crate) fn handle_query_file_delete_confirm_key(app: &mut App, key: KeyEvent)
             app.file_delete_target = None;
             app.close_modal_restore_focus();
         }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_document_create_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = app.previous_mode.clone().unwrap_or(AppMode::Normal);
+            app.previous_mode = None;
+        }
+        KeyCode::Enter => {
+            app.submit_document_create();
+        }
+        KeyCode::Tab => {
+            app.doc_form_step = (app.doc_form_step + 1) % 4;
+        }
+        KeyCode::Backspace => {
+            match app.doc_form_step {
+                0 => app.doc_form_uri.pop(),
+                1 => app.doc_form_collections.pop(),
+                2 => app.doc_form_quality.pop(),
+                3 => app.doc_form_content.pop(),
+                _ => None,
+            };
+        }
+        KeyCode::Char(c) => match app.doc_form_step {
+            0 => app.doc_form_uri.push(c),
+            1 => app.doc_form_collections.push(c),
+            2 => app.doc_form_quality.push(c),
+            3 => app.doc_form_content.push(c),
+            _ => {}
+        },
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_document_metadata_edit_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = app.previous_mode.clone().unwrap_or(AppMode::FullScreenView);
+            app.previous_mode = None;
+        }
+        KeyCode::Enter => {
+            app.submit_document_metadata_edit();
+        }
+        KeyCode::Tab => {
+            app.doc_form_step = (app.doc_form_step + 1) % 4;
+        }
+        KeyCode::Backspace => {
+            match app.doc_form_step {
+                0 => app.doc_form_uri.pop(),
+                1 => app.doc_form_collections.pop(),
+                2 => app.doc_form_quality.pop(),
+                3 => app.doc_form_content.pop(),
+                _ => None,
+            };
+        }
+        KeyCode::Char(c) => match app.doc_form_step {
+            0 => app.doc_form_uri.push(c),
+            1 => app.doc_form_collections.push(c),
+            2 => app.doc_form_quality.push(c),
+            3 => app.doc_form_content.push(c),
+            _ => {}
+        },
         _ => {}
     }
     Ok(false)
