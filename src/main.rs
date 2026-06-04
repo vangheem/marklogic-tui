@@ -8,8 +8,9 @@ mod tracked_folder;
 mod ui;
 
 use anyhow::Result;
+use chrono::{DateTime, Local};
 use clap::Parser;
-use client::{MarkLogicClient, SearchResult, ServerConfig};
+use client::{AppServerInfo, AuthType, MarkLogicClient, SearchResult, ServerConfig};
 use config::AppConfig;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -21,13 +22,14 @@ use edtui::{
 };
 #[cfg(test)]
 use events::{
-    handle_command_key, handle_filter_key, handle_fullscreen_key, handle_navigation_mode_key,
-    handle_query_insert_transition_key, handle_query_key, handle_results_key,
-    handle_return_to_start_page_key, handle_server_delete_confirm_key,
+    handle_command_key, handle_filter_key, handle_fullscreen_key, handle_log_viewer_key,
+    handle_navigation_mode_key, handle_query_insert_transition_key, handle_query_key,
+    handle_results_key, handle_return_to_start_page_key, handle_server_delete_confirm_key,
     handle_servers_interface_key, map_query_navigation_key,
 };
 #[cfg(test)]
 use external_editor::temp_editor_path;
+use flate2::{Compression, write::GzEncoder};
 use query_file::{
     QueryExecutionKind, discover_query_files, display_query_path, editor_lines,
     is_supported_query_file, load_query_file, query_execution_kind, save_query_file,
@@ -49,14 +51,18 @@ use ratatui::{
     },
 };
 use ratatui_textarea::{Input, TextArea};
+use std::str::FromStr;
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
+use tracing::{debug, error, info, warn};
 use tracked_folder::{TrackedFolderEntry, TrackedFolderStore, canonicalize_folder};
 use ui::{display_folder_path, format_document_detail, resolve_folder_input};
+
+const LOG_FILE_PATH: &str = "/tmp/marklogic-tui.log";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -84,6 +90,7 @@ enum AppMode {
     StartPage,
     Normal,
     FullScreenView,
+    LogViewer,
     Interface(AppInterface),
     ServerForm,
     ServerDeleteConfirm,
@@ -93,11 +100,14 @@ enum AppMode {
     QueryFileCreate,
     QueryFileRename,
     QueryFileDeleteConfirm,
+    ModuleCloneSelect,
     TrackedFolderSelect,
     TrackedFolderAdd,
     TrackedFolderDeleteConfirm,
     TrackedFolderCacheClearConfirm,
     HelpOverlay,
+    DocumentCreate,
+    DocumentMetadataEdit,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +125,7 @@ enum ServerFormMode {
 enum ServersInterfaceFocus {
     Servers,
     Databases,
+    AppServers,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +153,10 @@ struct App {
     query_files: Vec<PathBuf>,
     active_query_file: Option<PathBuf>,
     query_file_list_state: ListState,
+    module_clone_all_uris: Vec<String>,
+    module_clone_filtered_uris: Vec<String>,
+    module_clone_filter_input: String,
+    module_clone_list_state: ListState,
     tracked_folders: TrackedFolderStore,
     tracked_folder_items: Vec<TrackedFolderMenuItem>,
     tracked_folder_list_state: ListState,
@@ -182,6 +197,12 @@ struct App {
     full_view_scroll: u16,
     last_fullscreen_g: Option<Instant>,
     fullscreen_area_height: u16,
+    log_file_path: PathBuf,
+    log_view_content: String,
+    log_view_scroll: u16,
+    log_viewer_area_height: u16,
+    last_log_viewer_g: Option<Instant>,
+    last_logged_status_message: String,
     // Server management interface
     server_form_mode: ServerFormMode,
     server_form_step: usize,
@@ -189,12 +210,20 @@ struct App {
     server_edit_target: Option<String>,
     server_delete_target: Option<String>,
     servers_interface_focus: ServersInterfaceFocus,
+    // Document form (create / metadata edit)
+    doc_form_step: usize,
+    doc_form_uri: String,
+    doc_form_collections: String,
+    doc_form_quality: String,
+    doc_form_content: String,
     // Autocomplete
     autocomplete_suggestions: Vec<&'static str>,
     autocomplete_selected: usize,
     // Database selection
     database_list: Vec<String>,
     database_list_state: ListState,
+    app_server_list: Vec<AppServerInfo>,
+    app_server_list_state: ListState,
     // Server selection
     server_list: Vec<String>,
     server_list_state: ListState,
@@ -210,6 +239,18 @@ struct App {
 }
 
 impl App {
+    fn build_client_from_config(config: &AppConfig) -> Option<MarkLogicClient> {
+        let server = config.active_server_config()?.clone();
+        let mut client = MarkLogicClient::new(server);
+        if let Some(db) = &config.active_database {
+            client.set_database(db.clone());
+        }
+        if let Some(modules_db) = &config.active_modules_database {
+            client.set_modules_database(modules_db.clone());
+        }
+        Some(client)
+    }
+
     fn new(use_edtui: bool) -> Result<Self> {
         let config = AppConfig::load()?;
         let rt = Runtime::new()?;
@@ -221,13 +262,7 @@ impl App {
         let query_result_cache_dir = query_root_dir.join(".marklogic-tui");
         let query_files = discover_query_files(&query_root_dir)?;
         let active_query_file = query_files.first().cloned();
-        let client = config.active_server_config().map(|s| {
-            let mut c = MarkLogicClient::new(s.clone());
-            if let Some(db) = &config.active_database {
-                c.set_database(db.clone());
-            }
-            c
-        });
+        let client = Self::build_client_from_config(&config);
 
         let mut app_result = Ok(Self {
             config,
@@ -248,6 +283,10 @@ impl App {
             query_files,
             active_query_file,
             query_file_list_state: ListState::default(),
+            module_clone_all_uris: Vec::new(),
+            module_clone_filtered_uris: Vec::new(),
+            module_clone_filter_input: String::new(),
+            module_clone_list_state: ListState::default(),
             tracked_folders,
             tracked_folder_items: Vec::new(),
             tracked_folder_list_state: ListState::default(),
@@ -285,16 +324,29 @@ impl App {
             full_view_scroll: 0,
             last_fullscreen_g: None,
             fullscreen_area_height: 0,
+            log_file_path: PathBuf::from(LOG_FILE_PATH),
+            log_view_content: String::new(),
+            log_view_scroll: 0,
+            log_viewer_area_height: 0,
+            last_log_viewer_g: None,
+            last_logged_status_message: String::new(),
             server_form_mode: ServerFormMode::Add,
             server_form_step: 0,
-            server_form_fields: vec![String::new(); 5], // name, uri, user, pass, port
+            server_form_fields: vec![String::new(); 6], // name, uri, user, pass, port, auth
             server_edit_target: None,
             server_delete_target: None,
             servers_interface_focus: ServersInterfaceFocus::Servers,
+            doc_form_step: 0,
+            doc_form_uri: String::new(),
+            doc_form_collections: String::new(),
+            doc_form_quality: "0".to_string(),
+            doc_form_content: String::new(),
             autocomplete_suggestions: Vec::new(),
             autocomplete_selected: 0,
             database_list: Vec::new(),
             database_list_state: ListState::default(),
+            app_server_list: Vec::new(),
+            app_server_list_state: ListState::default(),
             server_list: Vec::new(),
             server_list_state: ListState::default(),
             collection_list: Vec::new(),
@@ -324,21 +376,26 @@ impl App {
     }
 
     const COMMANDS: &[(&str, &str)] = &[
+        // Server management
         (
             ":servers",
             "Open the server management interface [a=add, e=edit, d=remove]",
         ),
         (":server-add", "Open server management in add mode"),
         (":databases", "List databases"),
+        // Document listing
         (":list", "List all documents (paged)"),
         (":collections", "Show collections"),
         (":list:<collection>", "List documents in collection"),
         (":clear", "Clear collection filter and reset page"),
-        (":tdes", "List Template Driven Extraction templates"),
+        // Query management
         (":query", "Show the active query file"),
         (":query-files", "Open the query file picker"),
         (":query-open", "Open the query file picker"),
         (":folders", "Open the tracked folder selector"),
+        // Other
+        (":logs", "Open the application log viewer"),
+        (":tdes", "List Template Driven Extraction templates"),
         (":quit", "Quit the application"),
     ];
 
@@ -349,9 +406,9 @@ impl App {
             lines
         });
         ta.set_block(
-            Block::default().borders(Borders::ALL).title(
-                "Query [Alt+Enter or F5 to run, e to edit, Ctrl+S to save, Ctrl+O to switch]",
-            ),
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Query [Alt+Enter/F5 run, c clone, e edit, Ctrl+S save, Ctrl+O switch]"),
         );
         ta
     }
@@ -747,21 +804,17 @@ impl App {
             (AppMode::ServerForm, ServerFormMode::Add) => "SERVER ADD",
             (AppMode::ServerForm, ServerFormMode::Edit) => "SERVER EDIT",
             (AppMode::ServerDeleteConfirm, _) => "SERVER DELETE",
+            (AppMode::LogViewer, _) => "LOG VIEW",
             _ => self.edit_mode_label(),
         }
     }
 
     fn edit_mode_style(&self) -> Style {
+        let text = Color::Rgb(6, 12, 28);
         match self.edit_mode {
-            EditMode::Navigate => Style::default().fg(Color::White),
-            EditMode::Insert => Style::default().fg(Color::White).bg(Color::Red),
+            EditMode::Navigate => Style::default().fg(text).bg(Color::White).add_modifier(Modifier::BOLD),
+            EditMode::Insert => Style::default().fg(text).bg(Color::Red).add_modifier(Modifier::BOLD),
         }
-    }
-
-    fn start_page_mode_style(&self) -> Style {
-        Style::default()
-            .fg(self.edit_mode_accent_color())
-            .add_modifier(Modifier::BOLD)
     }
 
     fn edit_mode_accent_color(&self) -> Color {
@@ -777,19 +830,30 @@ impl App {
             .active_server
             .as_deref()
             .unwrap_or("(no server)");
+        let port = self
+            .config
+            .active_server_config()
+            .map(|s| s.port.to_string())
+            .unwrap_or_else(|| "-".to_string());
         let db = self
             .config
             .active_database
             .as_deref()
             .unwrap_or("(no database)");
 
-        let gray = Style::default().fg(Color::DarkGray);
+        let text = Color::Rgb(6, 12, 28);
+        let separator = Style::default().fg(Color::Rgb(100, 100, 100));
+        let server_style = Style::default().fg(text).add_modifier(Modifier::BOLD);
+        let port_style = Style::default().fg(text).add_modifier(Modifier::BOLD);
+        let database_style = Style::default().fg(text).add_modifier(Modifier::BOLD);
 
         vec![
-            Span::styled(" · ", gray),
-            Span::styled(server.to_string(), gray),
-            Span::styled(" · ", gray),
-            Span::styled(db.to_string(), gray),
+            Span::styled(" · ", separator),
+            Span::styled(server.to_string(), server_style),
+            Span::styled(":", separator),
+            Span::styled(port, port_style),
+            Span::styled(" · ", separator),
+            Span::styled(db.to_string(), database_style),
         ]
     }
 
@@ -821,6 +885,7 @@ impl App {
                 | AppMode::QueryFileCreate
                 | AppMode::QueryFileRename
                 | AppMode::QueryFileDeleteConfirm
+                | AppMode::ModuleCloneSelect
                 | AppMode::TrackedFolderSelect
                 | AppMode::TrackedFolderAdd
                 | AppMode::TrackedFolderDeleteConfirm
@@ -955,6 +1020,10 @@ impl App {
     }
 
     fn open_query_in_external_editor(&mut self) {
+        debug!(
+            active_query_file = ?self.active_query_file,
+            "opening query in external editor"
+        );
         let original_contents = self.query_text();
         let edit_result = external_editor::edit_text_in_external_editor(
             &original_contents,
@@ -995,6 +1064,62 @@ impl App {
                 }
             }
             Err(e) => {
+                error!(error = %e, "external query edit failed");
+                self.status_message = format!("External edit failed: {}", e);
+            }
+        }
+    }
+
+    fn refresh_log_viewer_content(&mut self) {
+        match fs::read_to_string(&self.log_file_path) {
+            Ok(content) => {
+                self.log_view_content = content;
+            }
+            Err(e) => {
+                self.log_view_content = format!(
+                    "Failed to read log file {}: {}",
+                    self.log_file_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    fn log_viewer_max_scroll(&self) -> u16 {
+        let total_lines = self.log_view_content.lines().count() as u16;
+        let visible_lines = self.log_viewer_area_height.saturating_sub(2);
+        total_lines.saturating_sub(visible_lines)
+    }
+
+    fn open_log_viewer(&mut self) {
+        if self.mode != AppMode::LogViewer {
+            self.previous_mode = Some(self.mode.clone());
+        }
+        self.mode = AppMode::LogViewer;
+        self.last_log_viewer_g = None;
+        self.refresh_log_viewer_content();
+        self.log_view_scroll = self.log_viewer_max_scroll();
+        debug!("opened log viewer");
+    }
+
+    fn close_log_viewer(&mut self) {
+        self.mode = self.previous_mode.take().unwrap_or(AppMode::Normal);
+        self.last_log_viewer_g = None;
+    }
+
+    fn open_log_in_external_editor(&mut self) {
+        debug!(path = %self.log_file_path.display(), "opening log file in external editor");
+        let edit_result = external_editor::open_file_in_external_editor(&self.log_file_path);
+        self.needs_terminal_refresh = true;
+
+        match edit_result {
+            Ok(()) => {
+                self.refresh_log_viewer_content();
+                self.log_view_scroll = self.log_viewer_max_scroll();
+                self.status_message = format!("Edited log: {}", self.log_file_path.display());
+            }
+            Err(e) => {
+                error!(error = %e, "external log edit failed");
                 self.status_message = format!("External edit failed: {}", e);
             }
         }
@@ -1274,6 +1399,10 @@ impl App {
     }
 
     fn open_document_in_external_editor(&mut self) {
+        debug!(
+            has_active_document = self.active_document.is_some(),
+            "opening document/content in external editor"
+        );
         let (original_content, path, is_document) = if let Some(ref detail) = self.active_document {
             (
                 detail.content.clone(),
@@ -1312,10 +1441,12 @@ impl App {
 
                     let client = client.clone();
                     let uri = self.active_document.as_ref().unwrap().uri.clone();
-                    match self
-                        .rt
-                        .block_on(client.update_document(&uri, &edited_contents))
-                    {
+                    match self.rt.block_on(client.update_document(
+                        &uri,
+                        &edited_contents,
+                        None,
+                        None,
+                    )) {
                         Ok(()) => {
                             let mut updated_detail = self.active_document.clone().unwrap();
                             updated_detail.content = edited_contents;
@@ -1337,7 +1468,116 @@ impl App {
                 }
             }
             Err(e) => {
+                error!(error = %e, "external document/content edit failed");
                 self.status_message = format!("External edit failed: {}", e);
+            }
+        }
+    }
+
+    fn open_document_create(&mut self) {
+        self.doc_form_step = 0;
+        self.doc_form_uri.clear();
+        self.doc_form_collections.clear();
+        self.doc_form_quality = "0".to_string();
+        self.doc_form_content.clear();
+        self.previous_mode = Some(self.mode.clone());
+        self.mode = AppMode::DocumentCreate;
+    }
+
+    fn submit_document_create(&mut self) {
+        let uri = self.doc_form_uri.trim().to_string();
+        if uri.is_empty() {
+            self.status_message = "URI is required.".to_string();
+            return;
+        }
+        let collections: Vec<String> = self
+            .doc_form_collections
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let quality = self.doc_form_quality.trim().parse::<i64>().unwrap_or(0);
+        let content = self.doc_form_content.clone();
+        let Some(client) = &self.client else {
+            self.status_message = "No server connected.".to_string();
+            return;
+        };
+        let client = client.clone();
+        match self
+            .rt
+            .block_on(client.create_document(&uri, &content, &collections, quality))
+        {
+            Ok(()) => {
+                self.status_message = format!("Created document: {}", uri);
+                self.mode = self.previous_mode.clone().unwrap_or(AppMode::Normal);
+                self.previous_mode = None;
+                self.fetch_list();
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to create document: {}", e);
+            }
+        }
+    }
+
+    fn open_document_metadata_edit(&mut self) {
+        if let Some(ref doc) = self.active_document {
+            self.doc_form_step = 0;
+            self.doc_form_uri = doc.uri.clone();
+            self.doc_form_collections = doc.collections.join(", ");
+            self.doc_form_quality = doc.quality.map(|q| q.to_string()).unwrap_or_default();
+            self.doc_form_content = doc.content.clone();
+            self.previous_mode = Some(self.mode.clone());
+            self.mode = AppMode::DocumentMetadataEdit;
+        }
+    }
+
+    fn submit_document_metadata_edit(&mut self) {
+        let Some(ref doc) = self.active_document else {
+            self.status_message = "No active document.".to_string();
+            return;
+        };
+        let uri = self.doc_form_uri.trim().to_string();
+        if uri.is_empty() {
+            self.status_message = "URI is required.".to_string();
+            return;
+        }
+        let collections: Vec<String> = self
+            .doc_form_collections
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let quality = self.doc_form_quality.trim().parse::<i64>().ok();
+        let Some(client) = &self.client else {
+            self.status_message = "No server connected.".to_string();
+            return;
+        };
+        let client = client.clone();
+        let content = self.doc_form_content.clone();
+        match self
+            .rt
+            .block_on(client.update_document(&uri, &content, Some(&collections), quality))
+        {
+            Ok(()) => {
+                let mut updated = doc.clone();
+                let uri_display = uri.clone();
+                updated.uri = uri;
+                updated.collections = collections;
+                updated.quality = quality;
+                updated.content = content;
+                self.set_active_document(updated);
+                self.status_message = format!("Updated document: {}", uri_display);
+                self.mode = self
+                    .previous_mode
+                    .clone()
+                    .unwrap_or(AppMode::FullScreenView);
+                self.previous_mode = None;
+                if !self.records.is_empty() {
+                    self.fetch_list();
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to update metadata: {}", e);
             }
         }
     }
@@ -1426,6 +1666,20 @@ impl App {
         self.transient_status_expires_at = Some(Instant::now() + duration);
     }
 
+    fn log_status_message_if_changed(&mut self) {
+        if self.status_message != self.last_logged_status_message {
+            if !self.status_message.is_empty() {
+                debug!(
+                    mode = ?self.mode,
+                    focus = ?self.focus,
+                    message = %self.status_message,
+                    "status message"
+                );
+            }
+            self.last_logged_status_message = self.status_message.clone();
+        }
+    }
+
     fn clear_expired_status_message(&mut self) {
         let Some(expires_at) = self.transient_status_expires_at else {
             return;
@@ -1483,9 +1737,172 @@ impl App {
         }
     }
 
+    fn rebuild_module_clone_filtered_uris(&mut self) {
+        let filter = self.module_clone_filter_input.to_lowercase();
+        self.module_clone_filtered_uris = if filter.is_empty() {
+            self.module_clone_all_uris.clone()
+        } else {
+            self.module_clone_all_uris
+                .iter()
+                .filter(|uri| uri.to_lowercase().contains(&filter))
+                .cloned()
+                .collect()
+        };
+
+        if self.module_clone_filtered_uris.is_empty() {
+            self.module_clone_list_state.select(None);
+        } else {
+            let selected = self.module_clone_list_state.selected().unwrap_or(0);
+            let clamped = selected.min(self.module_clone_filtered_uris.len().saturating_sub(1));
+            self.module_clone_list_state.select(Some(clamped));
+        }
+    }
+
+    fn move_module_clone_selection(&mut self, delta: isize) {
+        if self.module_clone_filtered_uris.is_empty() {
+            self.module_clone_list_state.select(None);
+            return;
+        }
+
+        let len = self.module_clone_filtered_uris.len() as isize;
+        let current = self
+            .module_clone_list_state
+            .selected()
+            .map(|idx| idx as isize)
+            .unwrap_or(if delta >= 0 { -1 } else { len });
+        let next = (current + delta).clamp(0, len - 1) as usize;
+        self.module_clone_list_state.select(Some(next));
+    }
+
+    fn selected_module_clone_uri(&self) -> Option<String> {
+        let selected = self.module_clone_list_state.selected()?;
+        self.module_clone_filtered_uris.get(selected).cloned()
+    }
+
+    fn clone_root_for_active_server_and_modules(&self, modules_database: &str) -> Option<PathBuf> {
+        let home = dirs::home_dir()?;
+        let server_label = self
+            .config
+            .active_server
+            .clone()
+            .or_else(|| self.client.as_ref().map(|c| c.server.name.clone()))?;
+        Some(
+            home.join(server_label)
+                .join("CLONES")
+                .join(modules_database),
+        )
+    }
+
+    fn open_module_clone_picker(&mut self) {
+        let Some(client) = self.client.clone() else {
+            self.status_message = "No server connected.".to_string();
+            return;
+        };
+
+        let Some(modules_db) = self.config.active_modules_database.clone() else {
+            self.status_message =
+                "No modules database selected. Use :servers and choose one under App Servers."
+                    .to_string();
+            return;
+        };
+
+        match self.rt.block_on(client.list_module_uris(&modules_db)) {
+            Ok(uris) => {
+                if uris.is_empty() {
+                    self.status_message =
+                        format!("No module URIs found in modules database '{}'.", modules_db);
+                    return;
+                }
+
+                self.module_clone_all_uris = uris;
+                self.module_clone_filter_input.clear();
+                self.module_clone_list_state.select(Some(0));
+                self.rebuild_module_clone_filtered_uris();
+                self.open_modal(AppMode::ModuleCloneSelect);
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to load module URIs: {}", e);
+            }
+        }
+    }
+
+    fn clone_selected_module(&mut self) {
+        let Some(uri) = self.selected_module_clone_uri() else {
+            self.status_message = "No module selected to clone.".to_string();
+            return;
+        };
+
+        let Some(modules_db) = self.config.active_modules_database.clone() else {
+            self.status_message =
+                "No modules database selected. Use :servers and choose one under App Servers."
+                    .to_string();
+            return;
+        };
+
+        let Some(client) = self.client.clone() else {
+            self.status_message = "No server connected.".to_string();
+            return;
+        };
+
+        let content = match self
+            .rt
+            .block_on(client.get_document_content_from_database(&uri, &modules_db))
+        {
+            Ok(content) => content,
+            Err(e) => {
+                self.status_message = format!("Failed to clone module '{}': {}", uri, e);
+                return;
+            }
+        };
+
+        let Some(clone_root) = self.clone_root_for_active_server_and_modules(&modules_db) else {
+            self.status_message =
+                "Could not resolve clone root (missing home directory or active server)."
+                    .to_string();
+            return;
+        };
+
+        let relative_uri = uri.trim_start_matches('/');
+        if relative_uri.is_empty() {
+            self.status_message = format!("Invalid module URI: {}", uri);
+            return;
+        }
+
+        let destination = clone_root.join(relative_uri);
+        if let Some(parent) = destination.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                self.status_message = format!("Failed to create clone directory: {}", e);
+                return;
+            }
+        }
+
+        if let Err(e) = fs::write(&destination, content) {
+            self.status_message = format!("Failed to write clone file: {}", e);
+            return;
+        }
+
+        match self.switch_query_root(clone_root.clone()) {
+            Ok(()) => {
+                self.mode = AppMode::Normal;
+                self.status_message =
+                    format!("Cloned {} to {}", uri, display_folder_path(&destination));
+            }
+            Err(e) => {
+                self.mode = AppMode::Normal;
+                self.status_message = format!(
+                    "Cloned {} to {}, but failed to switch folder: {}",
+                    uri,
+                    display_folder_path(&destination),
+                    e
+                );
+            }
+        }
+    }
+
     fn status_line(&self) -> Line<'static> {
-        let mode_span = Span::styled(self.status_mode_label(), self.edit_mode_style());
-        let mut spans = vec![Span::raw("  "), mode_span];
+        let mode_label = format!(" {} ", self.status_mode_label());
+        let mode_span = Span::styled(mode_label, self.edit_mode_style());
+        let mut spans = vec![Span::raw(" "), mode_span];
         spans.extend(self.status_identity_spans());
         Line::from(spans)
     }
@@ -1517,6 +1934,8 @@ impl App {
         let command = parts[0];
         let _arg = parts.get(1).map(|s| s.trim());
 
+        debug!(command = %command, "executing command");
+
         match command {
             "servers" => self.cmd_servers(),
             "server-add" => self.open_server_add(),
@@ -1546,6 +1965,7 @@ impl App {
             "query" => self.show_query_editor(),
             "query-files" | "query-open" => self.open_query_file_picker(),
             "folders" => self.open_tracked_folder_picker(),
+            "logs" => self.open_log_viewer(),
             "quit" => {
                 if let Err(e) = self.save_query_file_if_dirty() {
                     self.results_text = format!("Save error: {}", e);
@@ -1561,6 +1981,7 @@ impl App {
                     self.current_page = 0;
                     self.fetch_list();
                 } else {
+                    warn!(command = %command, "unknown command");
                     self.mode = previous_mode;
                     self.set_transient_status_message(
                         format!("Unknown command: :{}", command),
@@ -1572,13 +1993,7 @@ impl App {
     }
 
     fn reconnect(&mut self) {
-        self.client = self.config.active_server_config().map(|s| {
-            let mut c = MarkLogicClient::new(s.clone());
-            if let Some(db) = &self.config.active_database {
-                c.set_database(db.clone());
-            }
-            c
-        });
+        self.client = Self::build_client_from_config(&self.config);
     }
 
     fn cmd_servers(&mut self) {
@@ -1640,12 +2055,17 @@ impl App {
 
     fn open_servers_interface(&mut self) {
         self.rebuild_server_list();
-        self.refresh_database_list_for_interface();
+        self.refresh_servers_interface_data();
         self.servers_interface_focus = ServersInterfaceFocus::Servers;
         self.open_interface(AppInterface::Servers);
         if self.config.servers.is_empty() {
             self.status_message = "No servers configured. Press 'a' to add one.".to_string();
         }
+    }
+
+    fn refresh_servers_interface_data(&mut self) {
+        self.refresh_database_list_for_interface();
+        self.refresh_app_server_list_for_interface();
     }
 
     fn refresh_database_list_for_interface(&mut self) {
@@ -1680,6 +2100,40 @@ impl App {
         }
     }
 
+    fn refresh_app_server_list_for_interface(&mut self) {
+        if let Some(client) = &self.client {
+            let client = client.clone();
+            match self.rt.block_on(client.list_app_servers()) {
+                Ok(servers) => {
+                    self.app_server_list = servers;
+                    let selected = self
+                        .config
+                        .active_app_server
+                        .as_ref()
+                        .and_then(|active| {
+                            self.app_server_list.iter().position(|s| &s.name == active)
+                        })
+                        .or_else(|| {
+                            if self.app_server_list.is_empty() {
+                                None
+                            } else {
+                                Some(0)
+                            }
+                        });
+                    self.app_server_list_state.select(selected);
+                }
+                Err(e) => {
+                    self.app_server_list.clear();
+                    self.app_server_list_state.select(None);
+                    self.status_message = format!("Error listing app servers: {}", e);
+                }
+            }
+        } else {
+            self.app_server_list.clear();
+            self.app_server_list_state.select(None);
+        }
+    }
+
     fn move_database_selection(&mut self, delta: isize) {
         if self.database_list.is_empty() {
             self.database_list_state.select(None);
@@ -1694,6 +2148,22 @@ impl App {
             .unwrap_or(if delta >= 0 { -1 } else { len });
         let next = (current + delta).clamp(0, len - 1) as usize;
         self.database_list_state.select(Some(next));
+    }
+
+    fn move_app_server_selection(&mut self, delta: isize) {
+        if self.app_server_list.is_empty() {
+            self.app_server_list_state.select(None);
+            return;
+        }
+
+        let len = self.app_server_list.len() as isize;
+        let current = self
+            .app_server_list_state
+            .selected()
+            .map(|idx| idx as isize)
+            .unwrap_or(if delta >= 0 { -1 } else { len });
+        let next = (current + delta).clamp(0, len - 1) as usize;
+        self.app_server_list_state.select(Some(next));
     }
 
     fn activate_selected_database(&mut self) {
@@ -1722,13 +2192,86 @@ impl App {
         }
     }
 
+    fn activate_selected_app_server(&mut self) {
+        let Some(selected) = self.app_server_list_state.selected() else {
+            self.status_message = "No app server selected.".to_string();
+            return;
+        };
+        let Some(app_server) = self.app_server_list.get(selected).cloned() else {
+            self.status_message = "No app server selected.".to_string();
+            return;
+        };
+
+        if let Some(active_server_name) = self.config.active_server.clone()
+            && let Some(server) = self
+                .config
+                .servers
+                .iter_mut()
+                .find(|server| server.name == active_server_name)
+        {
+            server.port = app_server.port;
+        }
+
+        self.config.active_app_server = Some(app_server.name.clone());
+        if let Some(content_db) = app_server.content_database.clone() {
+            self.config.active_database = Some(content_db);
+        }
+        if let Some(modules_db) = app_server.modules_database.clone() {
+            self.config.active_modules_database = Some(modules_db);
+        }
+
+        match self.config.save() {
+            Ok(()) => {
+                self.reconnect();
+                self.refresh_servers_interface_data();
+                if let Some(c) = &mut self.client
+                    && let Some(db_name) = self.config.active_database.clone()
+                {
+                    c.set_database(db_name);
+                }
+                if let Some(c) = &mut self.client
+                    && let Some(modules_db) = self.config.active_modules_database.clone()
+                {
+                    c.set_modules_database(modules_db);
+                }
+                self.status_message = format!(
+                    "App server: {}:{}",
+                    app_server.name,
+                    app_server.port
+                );
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to save active app server: {}", e);
+            }
+        }
+    }
+
+    fn cycle_auth_type_next(&mut self) {
+        let current = self.server_form_fields[5].parse::<AuthType>().unwrap_or(AuthType::Digest);
+        let idx = AuthType::VARIANTS.iter().position(|v| v == &current).unwrap_or(0);
+        let next = AuthType::VARIANTS[(idx + 1) % AuthType::VARIANTS.len()];
+        self.server_form_fields[5] = next.to_string();
+    }
+
+    fn cycle_auth_type_prev(&mut self) {
+        let current = self.server_form_fields[5].parse::<AuthType>().unwrap_or(AuthType::Digest);
+        let idx = AuthType::VARIANTS.iter().position(|v| v == &current).unwrap_or(0);
+        let prev = if idx == 0 {
+            AuthType::VARIANTS[AuthType::VARIANTS.len() - 1]
+        } else {
+            AuthType::VARIANTS[idx - 1]
+        };
+        self.server_form_fields[5] = prev.to_string();
+    }
+
     fn open_server_add(&mut self) {
         if self.mode != AppMode::Interface(AppInterface::Servers) {
             self.open_servers_interface();
         }
         self.server_form_mode = ServerFormMode::Add;
         self.server_form_step = 0;
-        self.server_form_fields = vec![String::new(); 5];
+        self.server_form_fields = vec![String::new(); 6];
+        self.server_form_fields[5] = "digest".to_string();
         self.server_edit_target = None;
         self.mode = AppMode::ServerForm;
     }
@@ -1751,6 +2294,7 @@ impl App {
             server.username.clone(),
             server.password.clone(),
             server.port.to_string(),
+            server.auth_type.to_string(),
         ];
         self.server_edit_target = Some(server.name.clone());
         self.mode = AppMode::ServerForm;
@@ -1762,6 +2306,7 @@ impl App {
         let username = self.server_form_fields[2].trim().to_string();
         let password = self.server_form_fields[3].clone();
         let port_input = self.server_form_fields[4].trim();
+        let auth_input = self.server_form_fields[5].trim();
 
         if name.is_empty() || uri.is_empty() {
             self.status_message = "Name and URI are required.".to_string();
@@ -1775,6 +2320,18 @@ impl App {
                 Ok(port) => port,
                 Err(_) => {
                     self.status_message = "Port must be a number from 0 to 65535.".to_string();
+                    return;
+                }
+            }
+        };
+
+        let auth_type = if auth_input.is_empty() {
+            AuthType::Digest
+        } else {
+            match AuthType::from_str(auth_input) {
+                Ok(t) => t,
+                Err(_) => {
+                    self.status_message = "Auth type must be digest, basic, digestbasic, or application-level.".to_string();
                     return;
                 }
             }
@@ -1805,6 +2362,7 @@ impl App {
             username,
             password,
             port,
+            auth_type,
         };
         self.config.add_server(server);
         if was_edit && was_active {
@@ -1847,7 +2405,7 @@ impl App {
                 self.current_collection = None;
                 self.current_page = 0;
                 self.rebuild_server_list();
-                self.refresh_database_list_for_interface();
+                self.refresh_servers_interface_data();
                 self.status_message = format!("Switched to server: {}", name);
             }
             Err(e) => {
@@ -1980,6 +2538,13 @@ impl App {
     }
 
     fn fetch_list(&mut self) {
+        debug!(
+            page = self.current_page,
+            page_size = self.page_size,
+            collection = ?self.current_collection,
+            uri_filter = ?self.uri_filter,
+            "fetching document list"
+        );
         self.recalculate_page_size();
 
         // Enter document-list mode for the results pane and drop any stale query output.
@@ -2002,6 +2567,13 @@ impl App {
                 .block_on(client.search_documents(col, None, dir, start, self.page_size))
             {
                 Ok(paged) => {
+                    info!(
+                        page = self.current_page,
+                        page_size = self.page_size,
+                        returned = paged.results.len(),
+                        total = ?paged.total,
+                        "fetched document list"
+                    );
                     self.total_results = paged.total;
                     self.records = paged.results;
                     self.list_state.select(if self.records.is_empty() {
@@ -2018,10 +2590,12 @@ impl App {
                     self.status_message = String::new();
                 }
                 Err(e) => {
+                    error!(error = %e, "failed to fetch document list");
                     self.results_text = format!("Error: {}", e);
                 }
             }
         } else {
+            warn!("fetch_list requested without active client");
             self.results_text = "No server connected.".to_string();
         }
     }
@@ -2050,8 +2624,21 @@ impl App {
         }
 
         if let Some(client) = &self.client {
-            let client = client.clone();
+            let mut client = client.clone();
             let query = self.query_text();
+            let modules_db_override = parse_modules_database_override(&query);
+            if let Some(override_db) = modules_db_override.as_ref() {
+                client.set_modules_database(override_db.clone());
+                self.status_message = format!("Query modules DB override: {}", override_db);
+            }
+            debug!(
+                file = %display_query_path(&path, &self.query_root_dir),
+                bytes = query.len(),
+                query = %query,
+                modules_database = ?client.modules_database,
+                modules_database_override = ?modules_db_override,
+                "executing query"
+            );
             let result = match query_execution_kind(&path) {
                 QueryExecutionKind::JavaScript => self.rt.block_on(client.js_query(&query)),
                 QueryExecutionKind::XQuery => self.rt.block_on(client.xquery_query(&query)),
@@ -2083,16 +2670,27 @@ impl App {
 
             match result {
                 Ok(parts) => {
+                    info!(
+                        file = %display_query_path(&path, &self.query_root_dir),
+                        parts = parts.len(),
+                        "query executed successfully"
+                    );
                     self.set_query_results(parts);
                     self.persist_query_results_for_path(&path);
                 }
                 Err(e) => {
+                    error!(
+                        file = %display_query_path(&path, &self.query_root_dir),
+                        error = %e,
+                        "query execution failed"
+                    );
                     self.query_results.clear();
                     self.query_results_state.select(None);
                     self.results_text = format!("Query error: {}", e);
                 }
             }
         } else {
+            warn!("execute_query requested without active client");
             self.results_text = "No server connected.".to_string();
         }
     }
@@ -2160,34 +2758,42 @@ impl App {
             }
         }
     }
+}
 
-    fn snippet(record: &SearchResult) -> String {
-        let cols = if record.collections.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", record.collections.join(", "))
-        };
-        format!("{}{}", record.uri, cols)
+fn parse_modules_database_override(query: &str) -> Option<String> {
+    const PREFIX: &str = "(:~modules-database:";
+    for line in query.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(PREFIX)
+            && let Some((db, suffix)) = rest.split_once(":)")
+            && suffix.trim().is_empty()
+        {
+            let db = db.trim();
+            if !db.is_empty() {
+                return Some(db.to_string());
+            }
+        }
     }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppInterface, AppMode, EditMode, Focus, ServerFormMode, ServersInterfaceFocus,
-        TrackedFolderEntry, TrackedFolderMenuItem, display_folder_path, handle_command_key,
-        handle_filter_key, handle_fullscreen_key, handle_navigation_mode_key,
-        handle_query_insert_transition_key, handle_query_key, handle_results_key,
-        handle_return_to_start_page_key, handle_server_delete_confirm_key,
-        handle_servers_interface_key, map_query_navigation_key, resolve_folder_input,
-        temp_editor_path,
+        App, AppInterface, AppMode, EditMode, Focus, LOG_FILE_PATH, ServerFormMode,
+        ServersInterfaceFocus, TrackedFolderEntry, TrackedFolderMenuItem, display_folder_path,
+        handle_command_key, handle_filter_key, handle_fullscreen_key, handle_log_viewer_key,
+        handle_navigation_mode_key, handle_query_insert_transition_key, handle_query_key,
+        handle_results_key, handle_return_to_start_page_key, handle_server_delete_confirm_key,
+        handle_servers_interface_key, map_query_navigation_key, parse_modules_database_override,
+        resolve_folder_input, temp_editor_path,
     };
-    use crate::client::ServerConfig;
+    use crate::client::{AppServerInfo, AuthType, ServerConfig};
     use crate::config::AppConfig;
     use crate::tracked_folder::TrackedFolderStore;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use edtui::{EditorEventHandler, EditorState};
-    use ratatui::style::{Color, Style};
+    use ratatui::style::{Color, Modifier, Style};
     use ratatui::widgets::{ListState, TableState};
     use std::{
         fs,
@@ -2216,6 +2822,10 @@ mod tests {
             query_files: Vec::new(),
             active_query_file: None,
             query_file_list_state: ListState::default(),
+            module_clone_all_uris: Vec::new(),
+            module_clone_filtered_uris: Vec::new(),
+            module_clone_filter_input: String::new(),
+            module_clone_list_state: ListState::default(),
             tracked_folders: TrackedFolderStore::default(),
             tracked_folder_items: Vec::new(),
             tracked_folder_list_state: ListState::default(),
@@ -2251,16 +2861,29 @@ mod tests {
             active_document: None,
             full_view_content: String::new(),
             full_view_scroll: 0,
+            log_file_path: PathBuf::from(LOG_FILE_PATH),
+            log_view_content: String::new(),
+            log_view_scroll: 0,
+            log_viewer_area_height: 0,
+            last_log_viewer_g: None,
+            last_logged_status_message: String::new(),
             server_form_mode: ServerFormMode::Add,
             server_form_step: 0,
-            server_form_fields: vec![String::new(); 5],
+            server_form_fields: vec![String::new(); 6],
             server_edit_target: None,
             server_delete_target: None,
             servers_interface_focus: ServersInterfaceFocus::Servers,
+            doc_form_step: 0,
+            doc_form_uri: String::new(),
+            doc_form_collections: String::new(),
+            doc_form_quality: "0".to_string(),
+            doc_form_content: String::new(),
             autocomplete_suggestions: Vec::new(),
             autocomplete_selected: 0,
             database_list: Vec::new(),
             database_list_state: ListState::default(),
+            app_server_list: Vec::new(),
+            app_server_list_state: ListState::default(),
             server_list: Vec::new(),
             server_list_state: ListState::default(),
             collection_list: Vec::new(),
@@ -2272,6 +2895,19 @@ mod tests {
             edtui_state: EditorState::default(),
             edtui_handler: EditorEventHandler::default(),
         }
+    }
+
+    #[test]
+    fn build_client_from_config_applies_modules_database() {
+        let mut config = AppConfig::default();
+        config.servers = vec![test_server("local", "http://localhost")];
+        config.active_server = Some("local".to_string());
+        config.active_database = Some("Documents".to_string());
+        config.active_modules_database = Some("Modules".to_string());
+
+        let client = App::build_client_from_config(&config).expect("client should build");
+        assert_eq!(client.database.as_deref(), Some("Documents"));
+        assert_eq!(client.modules_database.as_deref(), Some("Modules"));
     }
 
     fn temp_test_dir(name: &str) -> PathBuf {
@@ -2294,6 +2930,7 @@ mod tests {
             username: "admin".to_string(),
             password: "admin".to_string(),
             port: 8003,
+            auth_type: AuthType::Digest,
         }
     }
 
@@ -3175,6 +3812,7 @@ mod tests {
         assert_eq!(app.server_form_fields[0], "local");
         assert_eq!(app.server_form_fields[1], "http://localhost");
         assert_eq!(app.server_form_fields[4], "8003");
+        assert_eq!(app.server_form_fields[5], "digest");
     }
 
     #[test]
@@ -3190,6 +3828,68 @@ mod tests {
         assert_eq!(app.mode, AppMode::Interface(AppInterface::Servers));
         assert!(app.server_delete_target.is_none());
         assert_eq!(app.config.servers.len(), 1);
+    }
+
+    #[test]
+    fn server_form_auth_type_cycles_forward() {
+        let mut app = test_app();
+        app.open_server_add();
+
+        app.server_form_step = 5;
+        assert_eq!(app.server_form_fields[5], "digest");
+
+        app.cycle_auth_type_next();
+        assert_eq!(app.server_form_fields[5], "basic");
+
+        app.cycle_auth_type_next();
+        assert_eq!(app.server_form_fields[5], "digestbasic");
+
+        app.cycle_auth_type_next();
+        assert_eq!(app.server_form_fields[5], "application-level");
+
+        app.cycle_auth_type_next();
+        assert_eq!(app.server_form_fields[5], "digest");
+    }
+
+    #[test]
+    fn server_form_auth_type_cycles_backward() {
+        let mut app = test_app();
+        app.open_server_add();
+
+        app.server_form_step = 5;
+        assert_eq!(app.server_form_fields[5], "digest");
+
+        app.cycle_auth_type_prev();
+        assert_eq!(app.server_form_fields[5], "application-level");
+
+        app.cycle_auth_type_prev();
+        assert_eq!(app.server_form_fields[5], "digestbasic");
+
+        app.cycle_auth_type_prev();
+        assert_eq!(app.server_form_fields[5], "basic");
+
+        app.cycle_auth_type_prev();
+        assert_eq!(app.server_form_fields[5], "digest");
+    }
+
+    #[test]
+    fn server_add_with_basic_auth_saves_correctly() {
+        let mut app = test_app();
+        app.open_server_add();
+        app.server_form_fields[0] = "prod".to_string();
+        app.server_form_fields[1] = "http://prod.example".to_string();
+        app.server_form_fields[2] = "admin".to_string();
+        app.server_form_fields[3] = "secret".to_string();
+        app.server_form_fields[4] = "8000".to_string();
+        app.server_form_fields[5] = "basic".to_string();
+
+        app.submit_server_form();
+
+        assert_eq!(app.mode, AppMode::Interface(AppInterface::Servers));
+        assert_eq!(app.config.servers.len(), 1);
+        let server = &app.config.servers[0];
+        assert_eq!(server.name, "prod");
+        assert_eq!(server.auth_type, AuthType::Basic);
     }
 
     #[test]
@@ -3211,7 +3911,7 @@ mod tests {
     }
 
     #[test]
-    fn servers_interface_tab_toggles_between_servers_and_databases() {
+    fn servers_interface_tab_cycles_servers_databases_app_servers() {
         let mut app = test_app();
         app.open_servers_interface();
 
@@ -3221,6 +3921,10 @@ mod tests {
             app.servers_interface_focus,
             ServersInterfaceFocus::Databases
         );
+
+        handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.servers_interface_focus, ServersInterfaceFocus::AppServers);
 
         handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
@@ -3240,6 +3944,87 @@ mod tests {
 
         assert_eq!(app.config.active_database.as_deref(), Some("Schemas"));
         assert_eq!(app.status_message, "Database: Schemas");
+    }
+
+    #[test]
+    fn servers_interface_app_server_enter_sets_port_and_databases() {
+        let mut app = test_app();
+        app.config.servers = vec![test_server("local", "http://localhost")];
+        app.config.active_server = Some("local".to_string());
+        app.mode = AppMode::Interface(AppInterface::Servers);
+        app.servers_interface_focus = ServersInterfaceFocus::AppServers;
+        app.app_server_list = vec![AppServerInfo {
+            name: "my-app-server".to_string(),
+            port: 8010,
+            content_database: Some("Content-DB".to_string()),
+            modules_database: Some("Modules-DB".to_string()),
+        }];
+        app.app_server_list_state.select(Some(0));
+
+        handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.config.active_app_server.as_deref(), Some("my-app-server"));
+        assert_eq!(app.config.active_database.as_deref(), Some("Content-DB"));
+        assert_eq!(
+            app.config.active_modules_database.as_deref(),
+            Some("Modules-DB")
+        );
+        assert_eq!(app.config.servers[0].port, 8010);
+    }
+
+    #[test]
+    fn module_clone_root_includes_modules_database_segment() {
+        let mut app = test_app();
+        app.config.active_server = Some("my-ml".to_string());
+
+        let root = app
+            .clone_root_for_active_server_and_modules("my-modules-db")
+            .expect("clone root should resolve");
+        let text = root.to_string_lossy();
+
+        assert!(text.contains("my-ml/CLONES/my-modules-db"));
+    }
+
+    #[test]
+    fn module_clone_filter_matches_substrings() {
+        let mut app = test_app();
+        app.module_clone_all_uris = vec![
+            "/foo/bar/one.xqy".to_string(),
+            "/baz/two.xqy".to_string(),
+            "/foo/qux/three.sjs".to_string(),
+        ];
+        app.module_clone_filter_input = "foo".to_string();
+
+        app.rebuild_module_clone_filtered_uris();
+
+        assert_eq!(app.module_clone_filtered_uris.len(), 2);
+        assert!(
+            app.module_clone_filtered_uris
+                .iter()
+                .all(|uri| uri.contains("foo"))
+        );
+    }
+
+    #[test]
+    fn parse_modules_database_override_reads_single_line_marker() {
+        let query = "xquery version \"1.0-ml\";\n(:~modules-database:foo-db:)\n1";
+        assert_eq!(
+            parse_modules_database_override(query).as_deref(),
+            Some("foo-db")
+        );
+    }
+
+    #[test]
+    fn parse_modules_database_override_ignores_inline_text_after_marker() {
+        let query = "(:~modules-database:foo-db:) trailing";
+        assert_eq!(parse_modules_database_override(query), None);
+    }
+
+    #[test]
+    fn parse_modules_database_override_returns_none_when_absent() {
+        let query = "xquery version \"1.0-ml\";\n1";
+        assert_eq!(parse_modules_database_override(query), None);
     }
 
     #[test]
@@ -3300,14 +4085,22 @@ mod tests {
     }
 
     #[test]
-    fn status_identity_spans_excludes_collection_and_uses_gray() {
+    fn status_identity_spans_excludes_collection_and_highlights_connection() {
         let mut app = test_app();
+        app.config.servers.push(ServerConfig {
+            name: "dockerlocal".to_string(),
+            uri: "http://localhost".to_string(),
+            username: "admin".to_string(),
+            password: "admin".to_string(),
+            port: 8000,
+            auth_type: AuthType::Digest,
+        });
         app.config.active_server = Some("dockerlocal".to_string());
         app.config.active_database = Some("Documents".to_string());
         app.current_collection = Some("/test/retention/set/r".to_string());
 
         let spans = app.status_identity_spans();
-        assert_eq!(spans.len(), 4);
+        assert_eq!(spans.len(), 6);
 
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
@@ -3315,15 +4108,51 @@ mod tests {
             "collection should not appear in identity spans"
         );
 
-        let gray = Style::default().fg(Color::DarkGray);
-        for span in &spans {
-            assert_eq!(span.style, gray, "identity spans should be gray");
-        }
+        assert_eq!(
+            spans[0].style,
+            Style::default().fg(Color::Rgb(100, 100, 100)),
+            "separator should be dark gray"
+        );
+        assert_eq!(
+            spans[1].style,
+            Style::default().fg(Color::Rgb(6, 12, 28)).add_modifier(Modifier::BOLD),
+            "server should be highlighted"
+        );
+        assert_eq!(
+            spans[2].style,
+            Style::default().fg(Color::Rgb(100, 100, 100)),
+            "port separator should be dark gray"
+        );
+        assert_eq!(
+            spans[3].style,
+            Style::default()
+                .fg(Color::Rgb(6, 12, 28))
+                .add_modifier(Modifier::BOLD),
+            "port should be highlighted"
+        );
+        assert_eq!(
+            spans[4].style,
+            Style::default().fg(Color::Rgb(100, 100, 100)),
+            "separator should be dark gray"
+        );
+        assert_eq!(
+            spans[5].style,
+            Style::default().fg(Color::Rgb(6, 12, 28)).add_modifier(Modifier::BOLD),
+            "database should be highlighted"
+        );
     }
 
     #[test]
     fn status_line_excludes_collection_and_status_message() {
         let mut app = test_app();
+        app.config.servers.push(ServerConfig {
+            name: "dockerlocal".to_string(),
+            uri: "http://localhost".to_string(),
+            username: "admin".to_string(),
+            password: "admin".to_string(),
+            port: 8000,
+            auth_type: AuthType::Digest,
+        });
         app.config.active_server = Some("dockerlocal".to_string());
         app.config.active_database = Some("Documents".to_string());
         app.current_collection = Some("/test/retention/set/r".to_string());
@@ -3333,7 +4162,7 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
 
         assert!(text.contains("NORMAL"), "mode should appear");
-        assert!(text.contains("dockerlocal"), "server should appear");
+        assert!(text.contains("dockerlocal:8000"), "server and port should appear");
         assert!(text.contains("Documents"), "database should appear");
         assert!(
             !text.contains("/test/retention/set/r"),
@@ -3348,15 +4177,24 @@ mod tests {
     #[test]
     fn status_line_stops_at_database() {
         let mut app = test_app();
+        app.config.servers.push(ServerConfig {
+            name: "srv".to_string(),
+            uri: "http://localhost".to_string(),
+            username: "admin".to_string(),
+            password: "admin".to_string(),
+            port: 8010,
+            auth_type: AuthType::Digest,
+        });
         app.config.active_server = Some("srv".to_string());
         app.config.active_database = Some("db".to_string());
 
         let line = app.status_line();
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
 
-        // Expected: "  NORMAL · srv · db"
+        // Expected: "  NORMAL · srv:8010 · db"
         assert!(text.starts_with("  NORMAL"));
         assert!(text.ends_with("db"));
+        assert!(text.contains("srv:8010"));
         let parts: Vec<&str> = text.split(" · ").collect();
         assert_eq!(
             parts.len(),
@@ -3534,11 +4372,136 @@ mod tests {
             "e should open editor for query results fullscreen"
         );
     }
+
+    #[test]
+    fn logs_command_opens_log_viewer() {
+        let mut app = test_app();
+        app.command_input = ":logs".to_string();
+
+        app.execute_command();
+
+        assert_eq!(app.mode, AppMode::LogViewer);
+    }
+
+    #[test]
+    fn log_viewer_q_restores_previous_mode() {
+        let mut app = test_app();
+        app.mode = AppMode::Normal;
+        app.previous_mode = Some(AppMode::StartPage);
+        app.log_view_content = "line1\nline2".to_string();
+        app.log_viewer_area_height = 10;
+        app.log_view_scroll = 1;
+
+        handle_log_viewer_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::StartPage);
+        assert_eq!(app.log_view_scroll, 1);
+    }
+}
+
+fn gzip_file(path: &Path) -> Result<()> {
+    let gz_path = PathBuf::from(format!("{}.gz", path.display()));
+    let mut input = fs::File::open(path)?;
+    let output = fs::File::create(&gz_path)?;
+    let mut encoder = GzEncoder::new(output, Compression::default());
+    io::copy(&mut input, &mut encoder)?;
+    encoder.finish()?;
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn gzip_logs_older_than_today(log_dir: &Path, today: chrono::NaiveDate) -> Result<()> {
+    for entry in fs::read_dir(log_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if !file_name.starts_with("marklogic-tui-") || !file_name.ends_with(".log") {
+            continue;
+        }
+
+        let modified = entry.metadata()?.modified()?;
+        let modified_date = DateTime::<Local>::from(modified).date_naive();
+        if modified_date < today {
+            gzip_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn rotate_log_on_start(log_path: &Path) -> Result<()> {
+    if !log_path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(log_path)?;
+    let modified = metadata.modified().unwrap_or(SystemTime::now());
+    let modified_local: DateTime<Local> = DateTime::from(modified);
+    let timestamp = modified_local.format("%Y-%m-%d_%H-%M-%S");
+    let rotated = log_path.with_file_name(format!(
+        "marklogic-tui-{}-{}.log",
+        timestamp,
+        std::process::id()
+    ));
+
+    fs::rename(log_path, &rotated)?;
+
+    let today = Local::now().date_naive();
+    if modified_local.date_naive() < today {
+        gzip_file(&rotated)?;
+    }
+
+    Ok(())
+}
+
+fn init_file_logging() -> Result<()> {
+    let log_path = PathBuf::from(LOG_FILE_PATH);
+    let log_dir = log_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid log path: {}", log_path.display()))?;
+
+    rotate_log_on_start(&log_path)?;
+    gzip_logs_older_than_today(log_dir, Local::now().date_naive())?;
+
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || {
+            log_file
+                .try_clone()
+                .expect("failed to clone log file handle")
+        })
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(true)
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber)?;
+    debug!(path = %log_path.display(), "logging initialized");
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let use_edtui = args.inline_editor.as_deref() == Some("edtui");
+
+    init_file_logging()?;
+    info!(use_edtui, "starting marklogic-tui");
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -3559,9 +4522,11 @@ fn main() -> Result<()> {
         }
         app.maybe_autosave();
         app.clear_expired_status_message();
+        app.log_status_message_if_changed();
     }
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    info!("shutting down marklogic-tui");
     Ok(())
 }

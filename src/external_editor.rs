@@ -63,6 +63,13 @@ pub(crate) fn edit_text_in_external_editor(
     edit_result
 }
 
+pub(crate) fn open_file_in_external_editor(path: &Path) -> Result<()> {
+    if env::var_os("EDITOR").is_none() {
+        bail!("$EDITOR is not set");
+    }
+    suspend_tui_for_external_editor(path)
+}
+
 fn suspend_tui_for_external_editor(path: &Path) -> Result<()> {
     disable_raw_mode().context("Failed to suspend raw mode")?;
     let mut stdout = io::stdout();
