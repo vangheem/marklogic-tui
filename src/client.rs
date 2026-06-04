@@ -3,7 +3,65 @@ use digest_auth::AuthContext;
 use reqwest::{Client, Method, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fs;
 use std::path::Path;
+use std::str::FromStr;
+use tracing::{debug, info, warn};
+
+const CURL_DEBUG_DIR: &str = "/tmp/marklogic-tui-curl";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+pub enum AuthType {
+    #[default]
+    #[serde(rename = "digest")]
+    Digest,
+    #[serde(rename = "basic")]
+    Basic,
+    #[serde(rename = "digestbasic")]
+    DigestBasic,
+    #[serde(rename = "application-level")]
+    ApplicationLevel,
+}
+
+impl AuthType {
+    pub const VARIANTS: &'static [AuthType] = &[
+        AuthType::Digest,
+        AuthType::Basic,
+        AuthType::DigestBasic,
+        AuthType::ApplicationLevel,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthType::Digest => "digest",
+            AuthType::Basic => "basic",
+            AuthType::DigestBasic => "digestbasic",
+            AuthType::ApplicationLevel => "application-level",
+        }
+    }
+}
+
+impl std::fmt::Display for AuthType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AuthType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "digest" => Ok(AuthType::Digest),
+            "basic" => Ok(AuthType::Basic),
+            "digestbasic" => Ok(AuthType::DigestBasic),
+            "application-level" | "applicationlevel" | "application" => {
+                Ok(AuthType::ApplicationLevel)
+            }
+            _ => Err(format!("Unknown auth type: {}", s)),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -12,6 +70,8 @@ pub struct ServerConfig {
     pub username: String,
     pub password: String,
     pub port: u16,
+    #[serde(default)]
+    pub auth_type: AuthType,
 }
 
 impl ServerConfig {
@@ -20,10 +80,62 @@ impl ServerConfig {
     }
 }
 
+/// Clean up old curl debug files and write the current one.
+/// Returns the path to the written file, or None if writing failed.
+fn write_curl_debug_file(
+    method: &Method,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+    username: &str,
+    password: &str,
+    auth_type: &AuthType,
+) -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(CURL_DEBUG_DIR);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::create_dir_all(&dir);
+
+    let mut cmd = format!("curl -X {} '{}'", method, url);
+
+    for (k, v) in headers {
+        cmd.push_str(&format!(" \n  -H '{}: {}'", k, v));
+    }
+
+    match auth_type {
+        AuthType::Basic => {
+            cmd.push_str(&format!(" \n  -u '{}:{}'", username, password));
+        }
+        AuthType::Digest | AuthType::DigestBasic => {
+            cmd.push_str(&format!(
+                " \n  --digest -u '{}:{}'",
+                username, password
+            ));
+        }
+        AuthType::ApplicationLevel => {}
+    }
+
+    if let Some(body) = body {
+        cmd.push_str(&format!(" \n  -d '{}'", body));
+    }
+
+    cmd.push('\n');
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let file = dir.join(format!("{}-{}.sh", method, ts));
+    match fs::write(&file, cmd) {
+        Ok(_) => Some(file),
+        Err(_) => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MarkLogicClient {
     pub server: ServerConfig,
     pub database: Option<String>,
+    pub modules_database: Option<String>,
     client: Client,
 }
 
@@ -50,12 +162,21 @@ pub struct PagedResults {
     pub total: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppServerInfo {
+    pub name: String,
+    pub port: u16,
+    pub content_database: Option<String>,
+    pub modules_database: Option<String>,
+}
+
 impl MarkLogicClient {
     pub fn new(server: ServerConfig) -> Self {
         let client = Client::new();
         Self {
             server,
             database: None,
+            modules_database: None,
             client,
         }
     }
@@ -64,14 +185,168 @@ impl MarkLogicClient {
         self.database = Some(db);
     }
 
+    pub fn set_modules_database(&mut self, db: String) {
+        self.modules_database = Some(db);
+    }
+
     fn system_url(&self, path: &str) -> String {
         format!("{}{}", self.server.base_url(), path)
+    }
+
+    fn log_request_attempt(&self, phase: &str, method: &Method, req: &RequestBuilder) {
+        let Some(cloned) = req.try_clone() else {
+            warn!(
+                phase,
+                method = %method,
+                "unable to clone request for URL logging"
+            );
+            return;
+        };
+
+        match cloned.build() {
+            Ok(request) => {
+                let url = request.url().to_string();
+                let query = request.url().query().unwrap_or("").to_string();
+                let headers: Vec<(String, String)> = request
+                    .headers()
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
+                    })
+                    .collect();
+                let body = request
+                    .body()
+                    .and_then(|b| b.as_bytes())
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(String::from);
+
+                debug!(
+                    phase,
+                    method = %method,
+                    url = %url,
+                    query = query,
+                    "sending MarkLogic request"
+                );
+
+                if let Some(curl_file) = write_curl_debug_file(
+                    method,
+                    &url,
+                    &headers,
+                    body.as_deref(),
+                    &self.server.username,
+                    &self.server.password,
+                    &self.server.auth_type,
+                ) {
+                    info!(
+                        curl_repro = %curl_file.display(),
+                        "curl command written for debugging"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    phase,
+                    method = %method,
+                    error = %e,
+                    "unable to build request for URL logging"
+                );
+            }
+        }
+    }
+
+    /// Unified request handler that dispatches to the appropriate auth strategy
+    /// based on the server's configured auth_type.
+    async fn request(
+        &self,
+        method: Method,
+        url: &str,
+        configure: impl Fn(RequestBuilder) -> RequestBuilder,
+    ) -> Result<Response> {
+        match self.server.auth_type {
+            AuthType::Digest => self.request_digest(method, url, configure).await,
+            AuthType::Basic => self.request_basic(method, url, configure).await,
+            AuthType::DigestBasic => {
+                match self.request_digest(method.clone(), url, &configure).await {
+                    Ok(resp) => Ok(resp),
+                    Err(_) => self.request_basic(method, url, configure).await,
+                }
+            }
+            AuthType::ApplicationLevel => self.request_no_auth(method, url, configure).await,
+        }
+    }
+
+    async fn request_no_auth(
+        &self,
+        method: Method,
+        url: &str,
+        configure: impl Fn(RequestBuilder) -> RequestBuilder,
+    ) -> Result<Response> {
+        let req = configure(self.client.request(method.clone(), url));
+        self.log_request_attempt("application-level", &method, &req);
+        let resp = req.send().await?;
+        debug!(
+            phase = "application-level",
+            method = %method,
+            url,
+            status = %resp.status(),
+            "received MarkLogic response"
+        );
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "{} {} failed with status {}: {}",
+                method,
+                url,
+                status,
+                body
+            );
+        }
+
+        Ok(resp)
+    }
+
+    async fn request_basic(
+        &self,
+        method: Method,
+        url: &str,
+        configure: impl Fn(RequestBuilder) -> RequestBuilder,
+    ) -> Result<Response> {
+        let req = configure(
+            self.client
+                .request(method.clone(), url)
+                .basic_auth(&self.server.username, Some(&self.server.password)),
+        );
+        self.log_request_attempt("basic-auth", &method, &req);
+        let resp = req.send().await?;
+        debug!(
+            phase = "basic-auth",
+            method = %method,
+            url,
+            status = %resp.status(),
+            "received MarkLogic response"
+        );
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "{} {} failed with status {}: {}",
+                method,
+                url,
+                status,
+                body
+            );
+        }
+
+        Ok(resp)
     }
 
     /// Perform a request with digest authentication.
     /// First sends without auth to get the WWW-Authenticate challenge,
     /// then retries with the computed digest header.
-    async fn request_with_digest(
+    async fn request_digest(
         &self,
         method: Method,
         url: &str,
@@ -79,7 +354,15 @@ impl MarkLogicClient {
     ) -> Result<Response> {
         // First request to get the digest challenge
         let req = configure(self.client.request(method.clone(), url));
+        self.log_request_attempt("initial", &method, &req);
         let resp = req.send().await?;
+        debug!(
+            phase = "initial",
+            method = %method,
+            url,
+            status = %resp.status(),
+            "received MarkLogic response"
+        );
 
         if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(resp);
@@ -128,13 +411,28 @@ impl MarkLogicClient {
             .to_header_string();
 
         // Retry with digest auth
-        let req = configure(self.client.request(method, url)).header("Authorization", auth_header);
+        let req = configure(self.client.request(method.clone(), url))
+            .header("Authorization", auth_header);
+        self.log_request_attempt("digest-auth-retry", &method, &req);
         let resp = req.send().await?;
+        debug!(
+            phase = "digest-auth-retry",
+            method = %method,
+            url,
+            status = %resp.status(),
+            "received MarkLogic response"
+        );
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!("Request failed with status {}: {}", status, body);
+            bail!(
+                "{} {} failed with status {}: {}",
+                method,
+                url,
+                status,
+                body
+            );
         }
 
         Ok(resp)
@@ -148,7 +446,7 @@ impl MarkLogicClient {
             8002
         );
         let resp = self
-            .request_with_digest(Method::GET, &url, |r| r)
+            .request(Method::GET, &url, |r| r)
             .await
             .context("Failed to list databases")?;
         let body: Value = resp.json().await?;
@@ -163,6 +461,49 @@ impl MarkLogicClient {
         Ok(dbs)
     }
 
+    /// List HTTP app servers with key properties from the manage API.
+    pub async fn list_app_servers(&self) -> Result<Vec<AppServerInfo>> {
+        let url = format!(
+            "{}:{}/manage/v2/servers?view=package&format=json",
+            self.server.uri.trim_end_matches('/'),
+            8002
+        );
+        let resp = self
+            .request(Method::GET, &url, |r| r)
+            .await
+            .context("Failed to list app servers")?;
+        let body: Value = resp.json().await?;
+        let mut servers = body["server-default-list"]["list-items"]["list-item"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|item| {
+                        let name = item["nameref"].as_str().unwrap_or("").to_string();
+                        let port = item["port"].as_u64().unwrap_or(0) as u16;
+                        let content_database = item["content-database"]
+                            .as_str()
+                            .map(String::from)
+                            .filter(|s| !s.is_empty());
+                        let modules_database = item["modules-database"]
+                            .as_str()
+                            .map(String::from)
+                            .filter(|s| !s.is_empty());
+                        AppServerInfo {
+                            name,
+                            port,
+                            content_database,
+                            modules_database,
+                        }
+                    })
+                    .filter(|entry| !entry.name.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        servers.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        Ok(servers)
+    }
+
     /// List collections in current database
     pub async fn list_collections(&self) -> Result<Vec<String>> {
         let db = self.database.as_deref().unwrap_or("Documents").to_string();
@@ -171,7 +512,7 @@ impl MarkLogicClient {
         let body_str = format!("javascript={}", urlencoding::encode(script));
         let db_clone = db.clone();
         let resp = self
-            .request_with_digest(Method::POST, &url, |r| {
+            .request(Method::POST, &url, |r| {
                 r.header("Content-Type", "application/x-www-form-urlencoded")
                     .query(&[("database", &db_clone)])
                     .body(body_str.clone())
@@ -183,6 +524,64 @@ impl MarkLogicClient {
         Ok(collections)
     }
 
+    /// List all module URIs from a specific modules database.
+    pub async fn list_module_uris(&self, modules_database: &str) -> Result<Vec<String>> {
+        let url = self.system_url("/v1/eval");
+        let script = r#"
+            'use strict';
+            const uris = [];
+            for (const node of fn.doc()) {
+              const uri = xdmp.nodeUri(node);
+              if (uri) {
+                uris.push(uri);
+              }
+            }
+            uris.sort();
+            JSON.stringify(uris);
+        "#;
+        let body_str = format!("javascript={}", urlencoding::encode(script));
+        let modules_db = modules_database.to_string();
+        let resp = self
+            .request(Method::POST, &url, |r| {
+                r.header("Content-Type", "application/x-www-form-urlencoded")
+                    .query(&[("database", modules_db.as_str())])
+                    .body(body_str.clone())
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to list module URIs from modules database '{}'",
+                    modules_database
+                )
+            })?;
+        let text = resp.text().await?;
+        let parts = parse_eval_response_parts(&text)?;
+        for part in parts {
+            if let Ok(uris) = serde_json::from_str::<Vec<String>>(&part) {
+                return Ok(uris);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Get a document's raw content from a specific database.
+    pub async fn get_document_content_from_database(
+        &self,
+        uri: &str,
+        database: &str,
+    ) -> Result<String> {
+        let url = self.system_url("/v1/documents");
+        let uri_owned = uri.to_string();
+        let db_owned = database.to_string();
+        let resp = self
+            .request(Method::GET, &url, |r| {
+                r.query(&[("database", db_owned.as_str()), ("uri", uri_owned.as_str())])
+            })
+            .await
+            .with_context(|| format!("Failed to read '{}' from database '{}'", uri, database))?;
+        Ok(resp.text().await?)
+    }
+
     /// Query using Optic API (rows endpoint)
     pub async fn optic_query(&self, dsl: &str) -> Result<Value> {
         let db = self.database.as_deref().unwrap_or("Documents").to_string();
@@ -190,7 +589,7 @@ impl MarkLogicClient {
         let dsl_owned = dsl.to_string();
         let db_clone = db.clone();
         let resp = self
-            .request_with_digest(Method::POST, &url, |r| {
+            .request(Method::POST, &url, |r| {
                 r.header(
                     "Content-Type",
                     "application/vnd.marklogic.querydsl+javascript",
@@ -212,7 +611,7 @@ impl MarkLogicClient {
         let body_str = format!("javascript={}", urlencoding::encode(script));
         let db_clone = db.clone();
         let resp = self
-            .request_with_digest(Method::POST, &url, |r| {
+            .request(Method::POST, &url, |r| {
                 r.header("Content-Type", "application/x-www-form-urlencoded")
                     .query(&[("database", db_clone.as_str())])
                     .body(body_str.clone())
@@ -230,7 +629,7 @@ impl MarkLogicClient {
         let body_str = format!("xquery={}", urlencoding::encode(script));
         let db_clone = db.clone();
         let resp = self
-            .request_with_digest(Method::POST, &url, |r| {
+            .request(Method::POST, &url, |r| {
                 r.header("Content-Type", "application/x-www-form-urlencoded")
                     .query(&[("database", db_clone.as_str())])
                     .body(body_str.clone())
@@ -267,7 +666,7 @@ impl MarkLogicClient {
         let db_clone = db.clone();
 
         let resp = self
-            .request_with_digest(Method::GET, &url, |mut r| {
+            .request(Method::GET, &url, |mut r| {
                 r = r.query(&[
                     ("database", db_clone.as_str()),
                     ("format", "json"),
@@ -322,7 +721,7 @@ impl MarkLogicClient {
             let body_str = format!("javascript={}", urlencoding::encode(&script));
             let db_clone2 = db.clone();
             if let Ok(resp) = self
-                .request_with_digest(Method::POST, &eval_url, |r| {
+                .request(Method::POST, &eval_url, |r| {
                     r.header("Content-Type", "application/x-www-form-urlencoded")
                         .query(&[("database", db_clone2.as_str())])
                         .body(body_str.clone())
@@ -404,7 +803,7 @@ impl MarkLogicClient {
         let db_clone = db.to_string();
 
         let resp = self
-            .request_with_digest(Method::POST, &eval_url, |r| {
+            .request(Method::POST, &eval_url, |r| {
                 r.header("Content-Type", "application/x-www-form-urlencoded")
                     .query(&[("database", db_clone.as_str())])
                     .body(body_str.clone())
@@ -456,7 +855,7 @@ impl MarkLogicClient {
 
         // Get content
         let resp = self
-            .request_with_digest(Method::GET, &url, |r| {
+            .request(Method::GET, &url, |r| {
                 r.query(&[("database", db_clone.as_str()), ("uri", uri_owned.as_str())])
             })
             .await
@@ -467,7 +866,7 @@ impl MarkLogicClient {
         let db_clone2 = db.clone();
         let uri_owned2 = uri.to_string();
         let meta_resp = self
-            .request_with_digest(Method::GET, &url, |r| {
+            .request(Method::GET, &url, |r| {
                 r.query(&[
                     ("database", db_clone2.as_str()),
                     ("uri", uri_owned2.as_str()),
@@ -522,21 +921,68 @@ impl MarkLogicClient {
         })
     }
 
-    /// Replace a single document's content by URI.
-    pub async fn update_document(&self, uri: &str, content: &str) -> Result<()> {
+    /// Replace a single document's content by URI, with optional collections and quality.
+    pub async fn update_document(
+        &self,
+        uri: &str,
+        content: &str,
+        collections: Option<&[String]>,
+        quality: Option<i64>,
+    ) -> Result<()> {
         let db = self.database.as_deref().unwrap_or("Documents").to_string();
         let url = self.system_url("/v1/documents");
         let uri_owned = uri.to_string();
         let db_clone = db.clone();
         let content_type = infer_document_content_type(uri, content);
 
-        self.request_with_digest(Method::PUT, &url, |r| {
-            r.query(&[("database", db_clone.as_str()), ("uri", uri_owned.as_str())])
+        self.request(Method::PUT, &url, |r| {
+            let mut builder = r
+                .query(&[("database", db_clone.as_str()), ("uri", uri_owned.as_str())])
                 .header("Content-Type", content_type)
-                .body(content.to_string())
+                .body(content.to_string());
+            if let Some(cols) = collections {
+                if !cols.is_empty() {
+                    builder = builder.header("X-ML-Document-Collections", cols.join(","));
+                }
+            }
+            if let Some(q) = quality {
+                builder = builder.header("X-ML-Document-Quality", q.to_string());
+            }
+            builder
         })
         .await
         .with_context(|| format!("Failed to update document: {}", uri))?;
+
+        Ok(())
+    }
+
+    /// Create a new document with URI, content, collections and quality.
+    pub async fn create_document(
+        &self,
+        uri: &str,
+        content: &str,
+        collections: &[String],
+        quality: i64,
+    ) -> Result<()> {
+        let db = self.database.as_deref().unwrap_or("Documents").to_string();
+        let url = self.system_url("/v1/documents");
+        let uri_owned = uri.to_string();
+        let db_clone = db.clone();
+        let content_type = infer_document_content_type(uri, content);
+
+        self.request(Method::PUT, &url, |r| {
+            let mut builder = r
+                .query(&[("database", db_clone.as_str()), ("uri", uri_owned.as_str())])
+                .header("Content-Type", content_type)
+                .body(content.to_string());
+            if !collections.is_empty() {
+                builder = builder.header("X-ML-Document-Collections", collections.join(","));
+            }
+            builder = builder.header("X-ML-Document-Quality", quality.to_string());
+            builder
+        })
+        .await
+        .with_context(|| format!("Failed to create document: {}", uri))?;
 
         Ok(())
     }
@@ -553,7 +999,7 @@ impl MarkLogicClient {
         for uri in uris {
             let db_clone = db.clone();
             let uri_clone = uri.clone();
-            self.request_with_digest(Method::DELETE, &url, |r| {
+            self.request(Method::DELETE, &url, |r| {
                 r.query(&[("database", db_clone.as_str()), ("uri", uri_clone.as_str())])
             })
             .await
@@ -696,6 +1142,7 @@ mod tests {
             username: "admin".to_string(),
             password: "admin".to_string(),
             port: 8003,
+            auth_type: AuthType::Digest,
         };
         MarkLogicClient::new(server)
     }
@@ -786,7 +1233,7 @@ mod tests {
         let eval_url = client.system_url("/v1/eval");
         let body_str = format!("javascript={}", script);
         let resp = client
-            .request_with_digest(Method::POST, &eval_url, |r| {
+            .request(Method::POST, &eval_url, |r| {
                 r.header("Content-Type", "application/x-www-form-urlencoded")
                     .query(&[("database", db)])
                     .body(body_str.clone())
@@ -804,7 +1251,7 @@ mod tests {
         let db = "data-platform-content";
         let url = client.system_url("/v1/search");
         let resp = client
-            .request_with_digest(Method::GET, &url, |r| {
+            .request(Method::GET, &url, |r| {
                 r.query(&[
                     ("database", db),
                     ("format", "json"),
