@@ -144,6 +144,7 @@ Type `:` followed by a command and press `Enter`. Tab-completion is available.
 | Key | Action |
 |---|---|
 | `Alt+Enter` / `Ctrl+Enter` / `F5` | Execute the query |
+| `c` | Open module clone picker |
 | `e` | Open the current query-pane contents in `$EDITOR`, then load the saved edits back |
 | `Ctrl+S` | Save the active query file immediately |
 | `Ctrl+O` | Open the query file picker |
@@ -179,15 +180,17 @@ Supported launch-directory file types: `.js`, `.mjs`, `.sjs`, `.xqy`, `.sql`, `.
 | `Space` / `PageDown` | Scroll down 20 lines |
 | `PageUp` | Scroll up 20 lines |
 
-### Server Select Popup
+### Servers Interface
 
 | Key | Action |
 |---|---|
-| `Enter` | Switch to selected server |
+| `Enter` | Activate selected server/database/app-server |
 | `j` / `Down` | Move selection down |
 | `k` / `Up` | Move selection up |
+| `Tab` | Cycle focus: Servers -> Databases -> App Servers |
 | `a` | Add a new server |
 | `d` | Delete selected server |
+| `r` | Refresh databases/app-servers lists |
 | `Esc` | Close popup |
 
 ### Server Add Wizard
