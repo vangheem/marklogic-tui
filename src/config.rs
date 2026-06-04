@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -9,8 +9,14 @@ use crate::client::ServerConfig;
 pub struct AppConfig {
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
+    #[serde(default)]
     pub active_server: Option<String>,
+    #[serde(default)]
     pub active_database: Option<String>,
+    #[serde(default)]
+    pub active_modules_database: Option<String>,
+    #[serde(default)]
+    pub active_app_server: Option<String>,
 }
 
 impl AppConfig {
@@ -35,7 +41,17 @@ impl AppConfig {
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path();
         let content = toml::to_string_pretty(self)?;
-        fs::write(&path, content)?;
+
+        // Validate: try to parse what we just serialized
+        if let Err(e) = toml::from_str::<AppConfig>(&content) {
+            bail!("Generated invalid TOML, refusing to write: {}", e);
+        }
+
+        // Write to temp file first, then rename atomically
+        let tmp_path = path.with_extension("toml.tmp");
+        fs::write(&tmp_path, &content)?;
+        fs::rename(&tmp_path, &path)?;
+
         Ok(())
     }
 
@@ -65,12 +81,14 @@ mod tests {
     use crate::client::ServerConfig;
 
     fn server(name: &str, uri: &str) -> ServerConfig {
+        use crate::client::AuthType;
         ServerConfig {
             name: name.to_string(),
             uri: uri.to_string(),
             username: "admin".to_string(),
             password: "admin".to_string(),
             port: 8003,
+            auth_type: AuthType::Digest,
         }
     }
 
@@ -80,6 +98,8 @@ mod tests {
             servers: vec![server("old", "http://old.example")],
             active_server: Some("old".to_string()),
             active_database: Some("Documents".to_string()),
+            active_modules_database: Some("Modules".to_string()),
+            active_app_server: Some("App-Services".to_string()),
         };
 
         config.add_server(server("new", "http://new.example"));
@@ -94,6 +114,8 @@ mod tests {
             servers: vec![server("local", "http://old.example")],
             active_server: Some("local".to_string()),
             active_database: None,
+            active_modules_database: None,
+            active_app_server: None,
         };
 
         config.add_server(server("local", "http://new.example"));
