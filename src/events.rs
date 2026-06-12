@@ -31,6 +31,11 @@ pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
                 }
                 AppMode::ServerForm => return handle_server_form_key(app, key),
                 AppMode::ServerDeleteConfirm => return handle_server_delete_confirm_key(app, key),
+                AppMode::AppServerList => return handle_app_server_list_key(app, key),
+                AppMode::AppServerForm => return handle_app_server_form_key(app, key),
+                AppMode::AppServerDeleteConfirm => {
+                    return handle_app_server_delete_confirm_key(app, key);
+                }
                 AppMode::CollectionSelect => return handle_collection_select_key(app, key),
                 AppMode::DeleteConfirm => return handle_delete_confirm_key(app, key),
                 AppMode::QueryFileSelect => return handle_query_file_select_key(app, key),
@@ -1126,6 +1131,11 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
                 app.refresh_servers_interface_data();
             }
         }
+        KeyCode::Char('p') => {
+            if app.servers_interface_focus == ServersInterfaceFocus::Servers {
+                app.open_app_server_list();
+            }
+        }
         KeyCode::Char('?') if key.modifiers.is_empty() => {
             app.previous_mode = Some(app.mode.clone());
             app.mode = AppMode::HelpOverlay;
@@ -1155,13 +1165,17 @@ pub(crate) fn handle_server_form_key(app: &mut App, key: KeyEvent) -> Result<boo
             };
         }
         KeyCode::Up => {
-            if app.server_form_step == 5 {
+            if app.server_form_step == 4 {
                 app.cycle_auth_type_prev();
+            } else if app.server_form_step == 5 {
+                app.cycle_insecure_flag();
             }
         }
         KeyCode::Down => {
-            if app.server_form_step == 5 {
+            if app.server_form_step == 4 {
                 app.cycle_auth_type_next();
+            } else if app.server_form_step == 5 {
+                app.cycle_insecure_flag();
             }
         }
         KeyCode::Backspace => {
@@ -1287,6 +1301,115 @@ pub(crate) fn handle_document_metadata_edit_key(app: &mut App, key: KeyEvent) ->
             3 => app.doc_form_content.push(c),
             _ => {}
         },
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_app_server_list_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = AppMode::Interface(AppInterface::Servers);
+        }
+        KeyCode::Char('a') => {
+            app.open_app_server_add();
+        }
+        KeyCode::Char('e') => {
+            app.open_app_server_edit();
+        }
+        KeyCode::Char('d') => {
+            let Some(selected) = app.app_server_list_state.selected() else {
+                app.status_message = "No app server selected.".to_string();
+                return Ok(false);
+            };
+            let Some(endpoint) = app.app_server_list.get(selected) else {
+                app.status_message = "No app server selected.".to_string();
+                return Ok(false);
+            };
+            app.app_server_delete_target = Some(endpoint.name.clone());
+            app.mode = AppMode::AppServerDeleteConfirm;
+        }
+        KeyCode::Char('r') => {
+            app.refresh_app_servers_from_discovery();
+        }
+        KeyCode::Enter => {
+            app.activate_selected_app_server();
+        }
+        KeyCode::Up => {
+            if app.app_server_list.is_empty() {
+                app.app_server_list_state.select(None);
+            } else {
+                let current = app.app_server_list_state.selected().unwrap_or(0);
+                app.app_server_list_state
+                    .select(Some(current.saturating_sub(1)));
+            }
+        }
+        KeyCode::Down => {
+            if app.app_server_list.is_empty() {
+                app.app_server_list_state.select(None);
+            } else {
+                let current = app.app_server_list_state.selected().unwrap_or(0);
+                let next = (current + 1).min(app.app_server_list.len().saturating_sub(1));
+                app.app_server_list_state.select(Some(next));
+            }
+        }
+        KeyCode::Home => {
+            if !app.app_server_list.is_empty() {
+                app.app_server_list_state.select(Some(0));
+            }
+        }
+        KeyCode::End => {
+            if !app.app_server_list.is_empty() {
+                app.app_server_list_state
+                    .select(Some(app.app_server_list.len().saturating_sub(1)));
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_app_server_form_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::AppServerList;
+        }
+        KeyCode::Enter => {
+            app.submit_app_server_form();
+        }
+        KeyCode::Tab => {
+            app.app_server_form_step = (app.app_server_form_step + 1) % 5;
+        }
+        KeyCode::BackTab => {
+            app.app_server_form_step = if app.app_server_form_step == 0 {
+                4
+            } else {
+                app.app_server_form_step - 1
+            };
+        }
+        KeyCode::Backspace => {
+            app.app_server_form_fields[app.app_server_form_step].pop();
+        }
+        KeyCode::Char(c) => {
+            app.app_server_form_fields[app.app_server_form_step].push(c);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_app_server_delete_confirm_key(
+    app: &mut App,
+    key: KeyEvent,
+) -> Result<bool> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.delete_app_server();
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.app_server_delete_target = None;
+            app.mode = AppMode::AppServerList;
+        }
         _ => {}
     }
     Ok(false)

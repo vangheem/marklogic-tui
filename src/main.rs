@@ -10,7 +10,7 @@ mod ui;
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use clap::Parser;
-use client::{AppServerInfo, AuthType, MarkLogicClient, SearchResult, ServerConfig};
+use client::{AppServerEndpoint, AuthType, MarkLogicClient, SearchResult, ServerConfig};
 use config::AppConfig;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -94,6 +94,9 @@ enum AppMode {
     Interface(AppInterface),
     ServerForm,
     ServerDeleteConfirm,
+    AppServerList,
+    AppServerForm,
+    AppServerDeleteConfirm,
     CollectionSelect,
     DeleteConfirm,
     QueryFileSelect,
@@ -210,6 +213,13 @@ struct App {
     server_edit_target: Option<String>,
     server_delete_target: Option<String>,
     servers_interface_focus: ServersInterfaceFocus,
+    // App server management
+    app_server_form_mode: ServerFormMode,
+    app_server_form_step: usize,
+    app_server_form_fields: Vec<String>,
+    app_server_edit_target: Option<String>,
+    app_server_delete_target: Option<String>,
+    app_server_list_server_name: Option<String>,
     // Document form (create / metadata edit)
     doc_form_step: usize,
     doc_form_uri: String,
@@ -222,7 +232,7 @@ struct App {
     // Database selection
     database_list: Vec<String>,
     database_list_state: ListState,
-    app_server_list: Vec<AppServerInfo>,
+    app_server_list: Vec<AppServerEndpoint>,
     app_server_list_state: ListState,
     // Server selection
     server_list: Vec<String>,
@@ -241,7 +251,7 @@ struct App {
 impl App {
     fn build_client_from_config(config: &AppConfig) -> Option<MarkLogicClient> {
         let server = config.active_server_config()?.clone();
-        let mut client = MarkLogicClient::new(server);
+        let mut client = MarkLogicClient::new(server).ok()?;
         if let Some(db) = &config.active_database {
             client.set_database(db.clone());
         }
@@ -332,10 +342,16 @@ impl App {
             last_logged_status_message: String::new(),
             server_form_mode: ServerFormMode::Add,
             server_form_step: 0,
-            server_form_fields: vec![String::new(); 6], // name, uri, user, pass, port, auth
+            server_form_fields: vec![String::new(); 6], // name, host, user, pass, auth, insecure
             server_edit_target: None,
             server_delete_target: None,
             servers_interface_focus: ServersInterfaceFocus::Servers,
+            app_server_form_mode: ServerFormMode::Add,
+            app_server_form_step: 0,
+            app_server_form_fields: vec![String::new(); 5], // name, port, secure, content_db, modules_db
+            app_server_edit_target: None,
+            app_server_delete_target: None,
+            app_server_list_server_name: None,
             doc_form_step: 0,
             doc_form_uri: String::new(),
             doc_form_collections: String::new(),
@@ -2015,7 +2031,7 @@ impl App {
                 } else {
                     ""
                 };
-                format!("{}{} - {}:{}", s.name, active, s.uri, s.port)
+                format!("{}{} - {}:{}", s.name, active, s.host, s.port)
             })
             .collect();
 
@@ -2101,37 +2117,31 @@ impl App {
     }
 
     fn refresh_app_server_list_for_interface(&mut self) {
-        if let Some(client) = &self.client {
-            let client = client.clone();
-            match self.rt.block_on(client.list_app_servers()) {
-                Ok(servers) => {
-                    self.app_server_list = servers;
-                    let selected = self
-                        .config
-                        .active_app_server
-                        .as_ref()
-                        .and_then(|active| {
-                            self.app_server_list.iter().position(|s| &s.name == active)
-                        })
-                        .or_else(|| {
-                            if self.app_server_list.is_empty() {
-                                None
-                            } else {
-                                Some(0)
-                            }
-                        });
-                    self.app_server_list_state.select(selected);
-                }
-                Err(e) => {
-                    self.app_server_list.clear();
-                    self.app_server_list_state.select(None);
-                    self.status_message = format!("Error listing app servers: {}", e);
-                }
+        if let Some(active_server_name) = self.config.active_server.as_deref() {
+            if let Some(server) = self.config.servers.iter().find(|s| s.name == active_server_name) {
+                self.app_server_list = server.app_servers.clone();
+            } else {
+                self.app_server_list.clear();
             }
         } else {
             self.app_server_list.clear();
-            self.app_server_list_state.select(None);
         }
+
+        let selected = self
+            .config
+            .active_app_server
+            .as_ref()
+            .and_then(|active| {
+                self.app_server_list.iter().position(|s| &s.name == active)
+            })
+            .or_else(|| {
+                if self.app_server_list.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                }
+            });
+        self.app_server_list_state.select(selected);
     }
 
     fn move_database_selection(&mut self, delta: isize) {
@@ -2210,6 +2220,7 @@ impl App {
                 .find(|server| server.name == active_server_name)
         {
             server.port = app_server.port;
+            server.secure = app_server.secure;
         }
 
         self.config.active_app_server = Some(app_server.name.clone());
@@ -2235,9 +2246,10 @@ impl App {
                     c.set_modules_database(modules_db);
                 }
                 self.status_message = format!(
-                    "App server: {}:{}",
+                    "App server: {}:{} ({})",
                     app_server.name,
-                    app_server.port
+                    app_server.port,
+                    if app_server.secure { "https" } else { "http" }
                 );
             }
             Err(e) => {
@@ -2247,21 +2259,231 @@ impl App {
     }
 
     fn cycle_auth_type_next(&mut self) {
-        let current = self.server_form_fields[5].parse::<AuthType>().unwrap_or(AuthType::Digest);
+        let current = self.server_form_fields[4].parse::<AuthType>().unwrap_or(AuthType::Digest);
         let idx = AuthType::VARIANTS.iter().position(|v| v == &current).unwrap_or(0);
         let next = AuthType::VARIANTS[(idx + 1) % AuthType::VARIANTS.len()];
-        self.server_form_fields[5] = next.to_string();
+        self.server_form_fields[4] = next.to_string();
     }
 
     fn cycle_auth_type_prev(&mut self) {
-        let current = self.server_form_fields[5].parse::<AuthType>().unwrap_or(AuthType::Digest);
+        let current = self.server_form_fields[4].parse::<AuthType>().unwrap_or(AuthType::Digest);
         let idx = AuthType::VARIANTS.iter().position(|v| v == &current).unwrap_or(0);
         let prev = if idx == 0 {
             AuthType::VARIANTS[AuthType::VARIANTS.len() - 1]
         } else {
             AuthType::VARIANTS[idx - 1]
         };
-        self.server_form_fields[5] = prev.to_string();
+        self.server_form_fields[4] = prev.to_string();
+    }
+
+    fn cycle_insecure_flag(&mut self) {
+        self.server_form_fields[5] = if self.server_form_fields[5].eq_ignore_ascii_case("y") {
+            "n".to_string()
+        } else {
+            "y".to_string()
+        };
+    }
+
+    fn open_app_server_list(&mut self) {
+        let Some(selected) = self.server_list_state.selected() else {
+            self.status_message = "No server selected.".to_string();
+            return;
+        };
+        let Some(server) = self.config.servers.get(selected) else {
+            self.status_message = "No server selected.".to_string();
+            return;
+        };
+
+        self.app_server_list_server_name = Some(server.name.clone());
+        self.app_server_list = server.app_servers.clone();
+        self.app_server_list_state.select(None);
+        self.mode = AppMode::AppServerList;
+    }
+
+    fn open_app_server_add(&mut self) {
+        self.app_server_form_mode = ServerFormMode::Add;
+        self.app_server_form_step = 0;
+        self.app_server_form_fields = vec![String::new(); 5];
+        self.app_server_form_fields[2] = "n".to_string();
+        self.app_server_edit_target = None;
+        self.mode = AppMode::AppServerForm;
+    }
+
+    fn open_app_server_edit(&mut self) {
+        let Some(selected) = self.app_server_list_state.selected() else {
+            self.status_message = "No app server selected.".to_string();
+            return;
+        };
+        let Some(endpoint) = self.app_server_list.get(selected) else {
+            self.status_message = "No app server selected.".to_string();
+            return;
+        };
+
+        self.app_server_form_mode = ServerFormMode::Edit;
+        self.app_server_form_step = 0;
+        self.app_server_form_fields = vec![
+            endpoint.name.clone(),
+            endpoint.port.to_string(),
+            if endpoint.secure { "y".to_string() } else { "n".to_string() },
+            endpoint.content_database.clone().unwrap_or_default(),
+            endpoint.modules_database.clone().unwrap_or_default(),
+        ];
+        self.app_server_edit_target = Some(endpoint.name.clone());
+        self.mode = AppMode::AppServerForm;
+    }
+
+    fn submit_app_server_form(&mut self) {
+        let name = self.app_server_form_fields[0].trim().to_string();
+        let port_input = self.app_server_form_fields[1].trim();
+        let secure_input = self.app_server_form_fields[2].trim();
+        let content_db = self.app_server_form_fields[3].trim();
+        let modules_db = self.app_server_form_fields[4].trim();
+
+        if name.is_empty() {
+            self.status_message = "App server name is required.".to_string();
+            return;
+        }
+
+        let port = match port_input.parse::<u16>() {
+            Ok(p) => p,
+            Err(_) => {
+                self.status_message = "Port must be a number from 0 to 65535.".to_string();
+                return;
+            }
+        };
+
+        let secure = secure_input.eq_ignore_ascii_case("y") || secure_input.eq_ignore_ascii_case("yes");
+
+        let Some(ref server_name) = self.app_server_list_server_name else {
+            self.status_message = "No server context.".to_string();
+            return;
+        };
+
+        let endpoint = AppServerEndpoint {
+            name: name.clone(),
+            port,
+            secure,
+            content_database: if content_db.is_empty() { None } else { Some(content_db.to_string()) },
+            modules_database: if modules_db.is_empty() { None } else { Some(modules_db.to_string()) },
+        };
+
+        let was_edit = self.app_server_form_mode == ServerFormMode::Edit;
+
+        if let Some(server) = self.config.servers.iter_mut().find(|s| &s.name == server_name) {
+            // Remove old if editing and name changed
+            if was_edit {
+                if let Some(ref old_name) = self.app_server_edit_target {
+                    if old_name != &name {
+                        server.app_servers.retain(|a| a.name != *old_name);
+                    } else {
+                        server.app_servers.retain(|a| a.name != name);
+                    }
+                }
+            } else {
+                server.app_servers.retain(|a| a.name != name);
+            }
+            server.app_servers.push(endpoint);
+            server.app_servers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        }
+
+        match self.config.save() {
+            Ok(()) => {
+                // Update the displayed list
+                if let Some(server) = self.config.servers.iter().find(|s| &s.name == server_name) {
+                    self.app_server_list = server.app_servers.clone();
+                }
+                self.app_server_edit_target = None;
+                self.mode = AppMode::AppServerList;
+                self.status_message = if was_edit {
+                    format!("Updated app server: {}", name)
+                } else {
+                    format!("Added app server: {}", name)
+                };
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to save app server: {}", e);
+            }
+        }
+    }
+
+    fn delete_app_server(&mut self) {
+        let Some(selected) = self.app_server_list_state.selected() else {
+            self.status_message = "No app server selected.".to_string();
+            return;
+        };
+        let Some(endpoint) = self.app_server_list.get(selected).cloned() else {
+            self.status_message = "No app server selected.".to_string();
+            return;
+        };
+
+        let Some(ref server_name) = self.app_server_list_server_name else {
+            return;
+        };
+
+        if let Some(server) = self.config.servers.iter_mut().find(|s| &s.name == server_name) {
+            server.app_servers.retain(|a| a.name != endpoint.name);
+        }
+
+        match self.config.save() {
+            Ok(()) => {
+                if let Some(server) = self.config.servers.iter().find(|s| &s.name == server_name) {
+                    self.app_server_list = server.app_servers.clone();
+                }
+                self.app_server_list_state.select(None);
+                self.mode = AppMode::AppServerList;
+                self.status_message = format!("Removed app server: {}", endpoint.name);
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to remove app server: {}", e);
+            }
+        }
+    }
+
+    fn refresh_app_servers_from_discovery(&mut self) {
+        let Some(ref server_name) = self.app_server_list_server_name else {
+            return;
+        };
+
+        let Some(server_config) = self.config.servers.iter().find(|s| &s.name == server_name).cloned() else {
+            return;
+        };
+
+        let client = match MarkLogicClient::new(server_config) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status_message = format!("Failed to create client: {}", e);
+                return;
+            }
+        };
+        match self.rt.block_on(client.list_app_servers()) {
+            Ok(discovered) => {
+                if let Some(server) = self.config.servers.iter_mut().find(|s| &s.name == server_name) {
+                    for disc in discovered {
+                        if let Some(existing) = server.app_servers.iter_mut().find(|a| a.name == disc.name) {
+                            existing.port = disc.port;
+                            existing.content_database = disc.content_database;
+                            existing.modules_database = disc.modules_database;
+                            // Only override secure if discovery found explicit SSL info
+                            existing.secure = disc.secure;
+                        } else {
+                            server.app_servers.push(disc);
+                        }
+                    }
+                    server.app_servers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                }
+                if let Some(server) = self.config.servers.iter().find(|s| &s.name == server_name) {
+                    self.app_server_list = server.app_servers.clone();
+                }
+                if let Err(e) = self.config.save() {
+                    self.status_message = format!("Failed to save discovered app servers: {}", e);
+                } else {
+                    self.status_message = "Refreshed app servers from discovery.".to_string();
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to discover app servers: {}", e);
+            }
+        }
     }
 
     fn open_server_add(&mut self) {
@@ -2271,7 +2493,8 @@ impl App {
         self.server_form_mode = ServerFormMode::Add;
         self.server_form_step = 0;
         self.server_form_fields = vec![String::new(); 6];
-        self.server_form_fields[5] = "digest".to_string();
+        self.server_form_fields[4] = "digest".to_string();
+        self.server_form_fields[5] = "n".to_string();
         self.server_edit_target = None;
         self.mode = AppMode::ServerForm;
     }
@@ -2290,11 +2513,11 @@ impl App {
         self.server_form_step = 0;
         self.server_form_fields = vec![
             server.name.clone(),
-            server.uri.clone(),
+            server.host.clone(),
             server.username.clone(),
             server.password.clone(),
-            server.port.to_string(),
             server.auth_type.to_string(),
+            if server.insecure { "y".to_string() } else { "n".to_string() },
         ];
         self.server_edit_target = Some(server.name.clone());
         self.mode = AppMode::ServerForm;
@@ -2302,28 +2525,16 @@ impl App {
 
     fn submit_server_form(&mut self) {
         let name = self.server_form_fields[0].trim().to_string();
-        let uri = self.server_form_fields[1].trim().to_string();
+        let host = self.server_form_fields[1].trim().to_string();
         let username = self.server_form_fields[2].trim().to_string();
         let password = self.server_form_fields[3].clone();
-        let port_input = self.server_form_fields[4].trim();
-        let auth_input = self.server_form_fields[5].trim();
+        let auth_input = self.server_form_fields[4].trim();
+        let insecure_input = self.server_form_fields[5].trim();
 
-        if name.is_empty() || uri.is_empty() {
-            self.status_message = "Name and URI are required.".to_string();
+        if name.is_empty() || host.is_empty() {
+            self.status_message = "Name and host are required.".to_string();
             return;
         }
-
-        let port = if port_input.is_empty() {
-            8003
-        } else {
-            match port_input.parse::<u16>() {
-                Ok(port) => port,
-                Err(_) => {
-                    self.status_message = "Port must be a number from 0 to 65535.".to_string();
-                    return;
-                }
-            }
-        };
 
         let auth_type = if auth_input.is_empty() {
             AuthType::Digest
@@ -2336,6 +2547,8 @@ impl App {
                 }
             }
         };
+
+        let insecure = insecure_input.eq_ignore_ascii_case("y") || insecure_input.eq_ignore_ascii_case("yes");
 
         let old_name = self.server_edit_target.clone();
         let was_edit = self.server_form_mode == ServerFormMode::Edit;
@@ -2350,6 +2563,13 @@ impl App {
             })
             .unwrap_or(false);
 
+        // Preserve app servers if editing
+        let existing_app_servers = if let Some(ref old) = old_name {
+            self.config.servers.iter().find(|s| s.name == *old).map(|s| s.app_servers.clone())
+        } else {
+            None
+        };
+
         if let Some(old_name) = old_name.as_deref() {
             if old_name != name {
                 self.config.remove_server(old_name);
@@ -2358,11 +2578,15 @@ impl App {
 
         let server = ServerConfig {
             name: name.clone(),
-            uri,
+            host,
             username,
             password,
-            port,
+            port: 8003,
+            secure: false,
             auth_type,
+            insecure,
+            app_servers: existing_app_servers.unwrap_or_default(),
+            uri: None,
         };
         self.config.add_server(server);
         if was_edit && was_active {
@@ -2686,7 +2910,13 @@ impl App {
                     );
                     self.query_results.clear();
                     self.query_results_state.select(None);
-                    self.results_text = format!("Query error: {}", e);
+                    let mut error_text = format!("Query error: {:#}", e);
+                    let mut current = e.source();
+                    while let Some(cause) = current {
+                        error_text.push_str(&format!("\nCaused by: {:#}", cause));
+                        current = cause.source();
+                    }
+                    self.results_text = error_text;
                 }
             }
         } else {
@@ -2788,7 +3018,7 @@ mod tests {
         handle_servers_interface_key, map_query_navigation_key, parse_modules_database_override,
         resolve_folder_input, temp_editor_path,
     };
-    use crate::client::{AppServerInfo, AuthType, ServerConfig};
+    use crate::client::{AppServerEndpoint, AuthType, ServerConfig};
     use crate::config::AppConfig;
     use crate::tracked_folder::TrackedFolderStore;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2873,6 +3103,12 @@ mod tests {
             server_edit_target: None,
             server_delete_target: None,
             servers_interface_focus: ServersInterfaceFocus::Servers,
+            app_server_form_mode: ServerFormMode::Add,
+            app_server_form_step: 0,
+            app_server_form_fields: vec![String::new(); 5],
+            app_server_edit_target: None,
+            app_server_delete_target: None,
+            app_server_list_server_name: None,
             doc_form_step: 0,
             doc_form_uri: String::new(),
             doc_form_collections: String::new(),
@@ -2900,7 +3136,7 @@ mod tests {
     #[test]
     fn build_client_from_config_applies_modules_database() {
         let mut config = AppConfig::default();
-        config.servers = vec![test_server("local", "http://localhost")];
+        config.servers = vec![test_server("local", "localhost")];
         config.active_server = Some("local".to_string());
         config.active_database = Some("Documents".to_string());
         config.active_modules_database = Some("Modules".to_string());
@@ -2923,14 +3159,18 @@ mod tests {
         std::env::temp_dir().join(unique)
     }
 
-    fn test_server(name: &str, uri: &str) -> ServerConfig {
+    fn test_server(name: &str, host: &str) -> ServerConfig {
         ServerConfig {
             name: name.to_string(),
-            uri: uri.to_string(),
+            host: host.to_string(),
             username: "admin".to_string(),
             password: "admin".to_string(),
             port: 8003,
+            secure: false,
             auth_type: AuthType::Digest,
+            insecure: false,
+            app_servers: vec![],
+            uri: None,
         }
     }
 
@@ -3764,9 +4004,9 @@ mod tests {
     fn servers_interface_navigation_supports_top_and_bottom() {
         let mut app = test_app();
         app.config.servers = vec![
-            test_server("one", "http://one.example"),
-            test_server("two", "http://two.example"),
-            test_server("three", "http://three.example"),
+            test_server("one", "one.example"),
+            test_server("two", "two.example"),
+            test_server("three", "three.example"),
         ];
         app.open_servers_interface();
 
@@ -3795,13 +4035,13 @@ mod tests {
 
         assert_eq!(app.mode, AppMode::ServerForm);
         assert!(app.config.servers.is_empty());
-        assert_eq!(app.status_message, "Name and URI are required.");
+        assert_eq!(app.status_message, "Name and host are required.");
     }
 
     #[test]
     fn server_edit_prefills_selected_server() {
         let mut app = test_app();
-        app.config.servers = vec![test_server("local", "http://localhost")];
+        app.config.servers = vec![test_server("local", "localhost")];
         app.open_servers_interface();
 
         app.open_server_edit();
@@ -3810,15 +4050,15 @@ mod tests {
         assert_eq!(app.server_form_mode, ServerFormMode::Edit);
         assert_eq!(app.server_edit_target.as_deref(), Some("local"));
         assert_eq!(app.server_form_fields[0], "local");
-        assert_eq!(app.server_form_fields[1], "http://localhost");
-        assert_eq!(app.server_form_fields[4], "8003");
-        assert_eq!(app.server_form_fields[5], "digest");
+        assert_eq!(app.server_form_fields[1], "localhost");
+        assert_eq!(app.server_form_fields[4], "digest");
+        assert_eq!(app.server_form_fields[5], "n");
     }
 
     #[test]
     fn server_delete_cancel_returns_to_servers_interface() {
         let mut app = test_app();
-        app.config.servers = vec![test_server("local", "http://localhost")];
+        app.config.servers = vec![test_server("local", "localhost")];
         app.open_servers_interface();
         app.start_delete_selected_server();
 
@@ -3835,20 +4075,20 @@ mod tests {
         let mut app = test_app();
         app.open_server_add();
 
-        app.server_form_step = 5;
-        assert_eq!(app.server_form_fields[5], "digest");
+        app.server_form_step = 4;
+        assert_eq!(app.server_form_fields[4], "digest");
 
         app.cycle_auth_type_next();
-        assert_eq!(app.server_form_fields[5], "basic");
+        assert_eq!(app.server_form_fields[4], "basic");
 
         app.cycle_auth_type_next();
-        assert_eq!(app.server_form_fields[5], "digestbasic");
+        assert_eq!(app.server_form_fields[4], "digestbasic");
 
         app.cycle_auth_type_next();
-        assert_eq!(app.server_form_fields[5], "application-level");
+        assert_eq!(app.server_form_fields[4], "application-level");
 
         app.cycle_auth_type_next();
-        assert_eq!(app.server_form_fields[5], "digest");
+        assert_eq!(app.server_form_fields[4], "digest");
     }
 
     #[test]
@@ -3856,20 +4096,20 @@ mod tests {
         let mut app = test_app();
         app.open_server_add();
 
-        app.server_form_step = 5;
-        assert_eq!(app.server_form_fields[5], "digest");
+        app.server_form_step = 4;
+        assert_eq!(app.server_form_fields[4], "digest");
 
         app.cycle_auth_type_prev();
-        assert_eq!(app.server_form_fields[5], "application-level");
+        assert_eq!(app.server_form_fields[4], "application-level");
 
         app.cycle_auth_type_prev();
-        assert_eq!(app.server_form_fields[5], "digestbasic");
+        assert_eq!(app.server_form_fields[4], "digestbasic");
 
         app.cycle_auth_type_prev();
-        assert_eq!(app.server_form_fields[5], "basic");
+        assert_eq!(app.server_form_fields[4], "basic");
 
         app.cycle_auth_type_prev();
-        assert_eq!(app.server_form_fields[5], "digest");
+        assert_eq!(app.server_form_fields[4], "digest");
     }
 
     #[test]
@@ -3877,11 +4117,11 @@ mod tests {
         let mut app = test_app();
         app.open_server_add();
         app.server_form_fields[0] = "prod".to_string();
-        app.server_form_fields[1] = "http://prod.example".to_string();
+        app.server_form_fields[1] = "prod.example".to_string();
         app.server_form_fields[2] = "admin".to_string();
         app.server_form_fields[3] = "secret".to_string();
-        app.server_form_fields[4] = "8000".to_string();
-        app.server_form_fields[5] = "basic".to_string();
+        app.server_form_fields[4] = "basic".to_string();
+        app.server_form_fields[5] = "n".to_string();
 
         app.submit_server_form();
 
@@ -3890,6 +4130,8 @@ mod tests {
         let server = &app.config.servers[0];
         assert_eq!(server.name, "prod");
         assert_eq!(server.auth_type, AuthType::Basic);
+        assert_eq!(server.host, "prod.example");
+        assert!(!server.insecure);
     }
 
     #[test]
@@ -3949,13 +4191,14 @@ mod tests {
     #[test]
     fn servers_interface_app_server_enter_sets_port_and_databases() {
         let mut app = test_app();
-        app.config.servers = vec![test_server("local", "http://localhost")];
+        app.config.servers = vec![test_server("local", "localhost")];
         app.config.active_server = Some("local".to_string());
         app.mode = AppMode::Interface(AppInterface::Servers);
         app.servers_interface_focus = ServersInterfaceFocus::AppServers;
-        app.app_server_list = vec![AppServerInfo {
+        app.app_server_list = vec![AppServerEndpoint {
             name: "my-app-server".to_string(),
             port: 8010,
+            secure: false,
             content_database: Some("Content-DB".to_string()),
             modules_database: Some("Modules-DB".to_string()),
         }];
@@ -4031,7 +4274,7 @@ mod tests {
     fn server_switch_keeps_servers_interface_open() {
         let mut app = test_app();
         app.focus_command_panel();
-        app.config.servers = vec![test_server("local", "http://localhost")];
+        app.config.servers = vec![test_server("local", "localhost")];
         app.open_servers_interface();
 
         handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -4089,11 +4332,15 @@ mod tests {
         let mut app = test_app();
         app.config.servers.push(ServerConfig {
             name: "dockerlocal".to_string(),
-            uri: "http://localhost".to_string(),
+            host: "localhost".to_string(),
             username: "admin".to_string(),
             password: "admin".to_string(),
             port: 8000,
+            secure: false,
             auth_type: AuthType::Digest,
+            insecure: false,
+            app_servers: vec![],
+            uri: None,
         });
         app.config.active_server = Some("dockerlocal".to_string());
         app.config.active_database = Some("Documents".to_string());
@@ -4147,11 +4394,15 @@ mod tests {
         let mut app = test_app();
         app.config.servers.push(ServerConfig {
             name: "dockerlocal".to_string(),
-            uri: "http://localhost".to_string(),
+            host: "localhost".to_string(),
             username: "admin".to_string(),
             password: "admin".to_string(),
             port: 8000,
+            secure: false,
             auth_type: AuthType::Digest,
+            insecure: false,
+            app_servers: vec![],
+            uri: None,
         });
         app.config.active_server = Some("dockerlocal".to_string());
         app.config.active_database = Some("Documents".to_string());
@@ -4179,11 +4430,15 @@ mod tests {
         let mut app = test_app();
         app.config.servers.push(ServerConfig {
             name: "srv".to_string(),
-            uri: "http://localhost".to_string(),
+            host: "localhost".to_string(),
             username: "admin".to_string(),
             password: "admin".to_string(),
             port: 8010,
+            secure: false,
             auth_type: AuthType::Digest,
+            insecure: false,
+            app_servers: vec![],
+            uri: None,
         });
         app.config.active_server = Some("srv".to_string());
         app.config.active_database = Some("db".to_string());
@@ -4194,7 +4449,7 @@ mod tests {
         // Expected: "  NORMAL · srv:8010 · db"
         assert!(text.starts_with("  NORMAL"));
         assert!(text.ends_with("db"));
-        assert!(text.contains("srv:8010"));
+        assert!(text.contains("srv:8010"), "expected srv:8010 in: {}", text);
         let parts: Vec<&str> = text.split(" · ").collect();
         assert_eq!(
             parts.len(),

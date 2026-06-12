@@ -64,19 +64,44 @@ impl FromStr for AuthType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppServerEndpoint {
+    pub name: String,
+    pub port: u16,
+    pub secure: bool,
+    #[serde(default)]
+    pub content_database: Option<String>,
+    #[serde(default)]
+    pub modules_database: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub name: String,
-    pub uri: String,
+    pub host: String,
     pub username: String,
     pub password: String,
     pub port: u16,
+    pub secure: bool,
     #[serde(default)]
     pub auth_type: AuthType,
+    #[serde(default)]
+    pub insecure: bool,
+    #[serde(default)]
+    pub app_servers: Vec<AppServerEndpoint>,
+    // Legacy field for backward compatibility migration
+    #[serde(default)]
+    pub uri: Option<String>,
 }
 
 impl ServerConfig {
     pub fn base_url(&self) -> String {
-        format!("{}:{}", self.uri.trim_end_matches('/'), self.port)
+        let scheme = if self.secure { "https" } else { "http" };
+        format!("{}://{}:{}", scheme, self.host, self.port)
+    }
+
+    pub fn manage_url(&self, path: &str) -> String {
+        let scheme = if self.secure { "https" } else { "http" };
+        format!("{}://{}:8002{}", scheme, self.host, path)
     }
 }
 
@@ -90,12 +115,17 @@ fn write_curl_debug_file(
     username: &str,
     password: &str,
     auth_type: &AuthType,
+    insecure: bool,
 ) -> Option<std::path::PathBuf> {
     let dir = std::path::PathBuf::from(CURL_DEBUG_DIR);
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::create_dir_all(&dir);
 
-    let mut cmd = format!("curl -X {} '{}'", method, url);
+    let mut cmd = if insecure {
+        format!("curl -k -X {} '{}'", method, url)
+    } else {
+        format!("curl -X {} '{}'", method, url)
+    };
 
     for (k, v) in headers {
         cmd.push_str(&format!(" \n  -H '{}: {}'", k, v));
@@ -162,23 +192,25 @@ pub struct PagedResults {
     pub total: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-pub struct AppServerInfo {
-    pub name: String,
-    pub port: u16,
-    pub content_database: Option<String>,
-    pub modules_database: Option<String>,
-}
+
 
 impl MarkLogicClient {
-    pub fn new(server: ServerConfig) -> Self {
-        let client = Client::new();
-        Self {
+    pub fn new(server: ServerConfig) -> Result<Self> {
+        let client = if server.insecure {
+            info!(host = %server.host, port = server.port, "Creating HTTP client with insecure TLS (skipping certificate validation)");
+            reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .context("Failed to build HTTP client with insecure TLS")?
+        } else {
+            Client::new()
+        };
+        Ok(Self {
             server,
             database: None,
             modules_database: None,
             client,
-        }
+        })
     }
 
     pub fn set_database(&mut self, db: String) {
@@ -236,6 +268,7 @@ impl MarkLogicClient {
                     &self.server.username,
                     &self.server.password,
                     &self.server.auth_type,
+                    self.server.insecure,
                 ) {
                     info!(
                         curl_repro = %curl_file.display(),
@@ -440,11 +473,7 @@ impl MarkLogicClient {
 
     /// List databases via the manage API (port 8002)
     pub async fn list_databases(&self) -> Result<Vec<String>> {
-        let url = format!(
-            "{}:{}/manage/v2/databases?format=json",
-            self.server.uri.trim_end_matches('/'),
-            8002
-        );
+        let url = self.server.manage_url("/manage/v2/databases?format=json");
         let resp = self
             .request(Method::GET, &url, |r| r)
             .await
@@ -462,12 +491,8 @@ impl MarkLogicClient {
     }
 
     /// List HTTP app servers with key properties from the manage API.
-    pub async fn list_app_servers(&self) -> Result<Vec<AppServerInfo>> {
-        let url = format!(
-            "{}:{}/manage/v2/servers?view=package&format=json",
-            self.server.uri.trim_end_matches('/'),
-            8002
-        );
+    pub async fn list_app_servers(&self) -> Result<Vec<AppServerEndpoint>> {
+        let url = self.server.manage_url("/manage/v2/servers?view=package&format=json");
         let resp = self
             .request(Method::GET, &url, |r| r)
             .await
@@ -488,9 +513,15 @@ impl MarkLogicClient {
                             .as_str()
                             .map(String::from)
                             .filter(|s| !s.is_empty());
-                        AppServerInfo {
+                        let secure = item["ssl-certificate-template"]
+                            .as_str()
+                            .map(|s| !s.is_empty())
+                            .or_else(|| item["ssl-enabled"].as_bool())
+                            .unwrap_or(false);
+                        AppServerEndpoint {
                             name,
                             port,
+                            secure,
                             content_database,
                             modules_database,
                         }
@@ -1138,13 +1169,17 @@ mod tests {
     fn test_client() -> MarkLogicClient {
         let server = ServerConfig {
             name: "local".to_string(),
-            uri: "http://localhost".to_string(),
+            host: "localhost".to_string(),
             username: "admin".to_string(),
             password: "admin".to_string(),
             port: 8003,
+            secure: false,
             auth_type: AuthType::Digest,
+            insecure: false,
+            app_servers: vec![],
+            uri: None,
         };
-        MarkLogicClient::new(server)
+        MarkLogicClient::new(server).expect("Failed to create test client")
     }
 
     #[tokio::test]

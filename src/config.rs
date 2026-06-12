@@ -32,9 +32,39 @@ impl AppConfig {
         let path = Self::config_path();
         if path.exists() {
             let content = fs::read_to_string(&path)?;
-            Ok(toml::from_str(&content)?)
+            let mut config: AppConfig = toml::from_str(&content)?;
+            config.migrate_legacy_servers();
+            Ok(config)
         } else {
             Ok(Self::default())
+        }
+    }
+
+    fn migrate_legacy_servers(&mut self) {
+        for server in &mut self.servers {
+            if let Some(ref uri) = server.uri {
+                if server.host.is_empty() {
+                    if let Ok(parsed) = url::Url::parse(uri) {
+                        server.host = parsed.host_str().unwrap_or(uri).to_string();
+                        server.secure = parsed.scheme() == "https";
+                    } else {
+                        server.host = uri.clone();
+                        server.secure = false;
+                    }
+                }
+                // Create default app server from old port if list is empty
+                if server.app_servers.is_empty() {
+                    let default_name = format!("app-{}", server.port);
+                    server.app_servers.push(crate::client::AppServerEndpoint {
+                        name: default_name,
+                        port: server.port,
+                        secure: server.secure,
+                        content_database: None,
+                        modules_database: None,
+                    });
+                }
+                server.uri = None;
+            }
         }
     }
 
@@ -80,29 +110,33 @@ mod tests {
     use super::AppConfig;
     use crate::client::ServerConfig;
 
-    fn server(name: &str, uri: &str) -> ServerConfig {
+    fn server(name: &str, host: &str) -> ServerConfig {
         use crate::client::AuthType;
         ServerConfig {
             name: name.to_string(),
-            uri: uri.to_string(),
+            host: host.to_string(),
             username: "admin".to_string(),
             password: "admin".to_string(),
             port: 8003,
+            secure: false,
             auth_type: AuthType::Digest,
+            insecure: false,
+            app_servers: vec![],
+            uri: None,
         }
     }
 
     #[test]
     fn add_server_makes_new_server_active() {
         let mut config = AppConfig {
-            servers: vec![server("old", "http://old.example")],
+            servers: vec![server("old", "old.example")],
             active_server: Some("old".to_string()),
             active_database: Some("Documents".to_string()),
             active_modules_database: Some("Modules".to_string()),
             active_app_server: Some("App-Services".to_string()),
         };
 
-        config.add_server(server("new", "http://new.example"));
+        config.add_server(server("new", "new.example"));
 
         assert_eq!(config.active_server.as_deref(), Some("new"));
         assert_eq!(config.servers.len(), 2);
@@ -111,17 +145,17 @@ mod tests {
     #[test]
     fn replacing_server_keeps_replacement_active() {
         let mut config = AppConfig {
-            servers: vec![server("local", "http://old.example")],
+            servers: vec![server("local", "old.example")],
             active_server: Some("local".to_string()),
             active_database: None,
             active_modules_database: None,
             active_app_server: None,
         };
 
-        config.add_server(server("local", "http://new.example"));
+        config.add_server(server("local", "new.example"));
 
         assert_eq!(config.active_server.as_deref(), Some("local"));
         assert_eq!(config.servers.len(), 1);
-        assert_eq!(config.servers[0].uri, "http://new.example");
+        assert_eq!(config.servers[0].host, "new.example");
     }
 }

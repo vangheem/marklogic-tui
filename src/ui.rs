@@ -126,6 +126,9 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         AppMode::Interface(AppInterface::Servers) => ui_servers_interface(f, app),
         AppMode::ServerForm => ui_server_form(f, app),
         AppMode::ServerDeleteConfirm => ui_server_delete_confirm(f, app),
+        AppMode::AppServerList => ui_app_server_list(f, app),
+        AppMode::AppServerForm => ui_app_server_form(f, app),
+        AppMode::AppServerDeleteConfirm => ui_app_server_delete_confirm(f, app),
         AppMode::CollectionSelect => ui_collection_select(f, app),
         AppMode::DeleteConfirm => ui_delete_confirm(f, app),
         AppMode::QueryFileSelect => ui_query_file_select(f, app),
@@ -1395,10 +1398,11 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
                     .as_deref()
                     .unwrap_or("(no modules db)");
                 ListItem::new(format!(
-                    "  {}{} · :{} · content={} · modules={}",
+                    "  {}{} · :{} · {} · content={} · modules={}",
                     app_server.name,
                     marker,
                     app_server.port,
+                    if app_server.secure { "https" } else { "http" },
                     content,
                     modules
                 ))
@@ -1432,7 +1436,7 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("App Servers [Enter=select, r=refresh]")
+                .title("App Servers [Enter=select, p=manage, r=refresh]")
                 .border_style(
                     if app.servers_interface_focus == ServersInterfaceFocus::AppServers {
                         Style::default().fg(Color::Yellow)
@@ -1465,12 +1469,20 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
                     Span::raw(server.name.clone()),
                 ]),
                 Line::from(vec![
-                    Span::styled("URI: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(server.uri.clone()),
+                    Span::styled("Host: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(server.host.clone()),
                 ]),
                 Line::from(vec![
                     Span::styled("Port: ", Style::default().fg(Color::Cyan)),
                     Span::raw(server.port.to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Secure: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(if server.secure { "yes" } else { "no" }),
+                ]),
+                Line::from(vec![
+                    Span::styled("Insecure: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(if server.insecure { "yes" } else { "no" }),
                 ]),
                 Line::from(vec![
                     Span::styled("Username: ", Style::default().fg(Color::Cyan)),
@@ -1521,6 +1533,7 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
                 Line::from("  a      Add a server"),
                 Line::from("  e      Edit selected server"),
                 Line::from("  d      Remove selected server"),
+                Line::from("  p      Manage app servers for selected server"),
                 Line::from("  r      Refresh databases/app-servers"),
                 Line::from("  q/Esc  Close interface"),
             ]
@@ -1550,11 +1563,11 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
 fn ui_server_form(f: &mut Frame, app: &App) {
     let labels = [
         "Name",
-        "URI (e.g. http://localhost)",
+        "Host (e.g. localhost)",
         "Username",
         "Password",
-        "Port (default 8003)",
         "Auth Type",
+        "Insecure SSL (y/n)",
     ];
     let area = centered_rect(60, 50, f.area());
     f.render_widget(Clear, area);
@@ -1609,6 +1622,137 @@ fn ui_server_form(f: &mut Frame, app: &App) {
         cursor_x.min(field_area.x + field_area.width.saturating_sub(1)),
         field_area.y + 1,
     ));
+}
+
+fn ui_app_server_list(f: &mut Frame, app: &App) {
+    let area = centered_rect(80, 70, f.area());
+    f.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(area);
+
+    let server_name = app
+        .app_server_list_server_name
+        .as_deref()
+        .unwrap_or("(unknown)");
+    let title = format!("App Servers for '{}' [a add, e edit, d delete, Enter activate, r refresh, Esc back]", server_name);
+
+    let items: Vec<ListItem> = if app.app_server_list.is_empty() {
+        vec![ListItem::new("  No app servers configured")]
+    } else {
+        app.app_server_list
+            .iter()
+            .map(|ep| {
+                let marker = if app.config.active_app_server.as_deref() == Some(ep.name.as_str()) {
+                    "* "
+                } else {
+                    "  "
+                };
+                let content = format!(
+                    "{}{} | port: {} | {} | db: {} | modules: {}",
+                    marker,
+                    ep.name,
+                    ep.port,
+                    if ep.secure { "https" } else { "http" },
+                    ep.content_database.as_deref().unwrap_or("-"),
+                    ep.modules_database.as_deref().unwrap_or("-"),
+                );
+                ListItem::new(content)
+            })
+            .collect()
+    };
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(list, chunks[0], &mut app.app_server_list_state.clone());
+
+    let help = Paragraph::new("Tab: focus | a: add | e: edit | d: delete | Enter: activate | r: refresh | Esc: back")
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(help, chunks[1]);
+}
+
+fn ui_app_server_form(f: &mut Frame, app: &App) {
+    let labels = [
+        "Name",
+        "Port",
+        "SSL (y/n)",
+        "Content Database",
+        "Modules Database",
+    ];
+    let area = centered_rect(60, 50, f.area());
+    f.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            labels
+                .iter()
+                .map(|_| Constraint::Length(3))
+                .chain(std::iter::once(Constraint::Min(0)))
+                .collect::<Vec<_>>(),
+        )
+        .split(area);
+
+    for (i, label) in labels.iter().enumerate() {
+        let style = if i == app.app_server_form_step {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let display = app.app_server_form_fields[i].clone();
+        let p = Paragraph::new(display).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(*label)
+                .border_style(style),
+        );
+        f.render_widget(p, chunks[i]);
+    }
+
+    let title = match app.app_server_form_mode {
+        ServerFormMode::Add => "Add App Server [Tab fields, Enter save, Esc cancel]",
+        ServerFormMode::Edit => "Edit App Server [Tab fields, Enter save, Esc cancel]",
+    };
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(Color::Cyan)),
+        area,
+    );
+
+    let field_area = chunks[app.app_server_form_step];
+    let cursor_x =
+        field_area.x + app.app_server_form_fields[app.app_server_form_step].chars().count() as u16 + 1;
+    f.set_cursor_position((
+        cursor_x.min(field_area.x + field_area.width.saturating_sub(1)),
+        field_area.y + 1,
+    ));
+}
+
+fn ui_app_server_delete_confirm(f: &mut Frame, app: &App) {
+    let target = app
+        .app_server_delete_target
+        .as_deref()
+        .unwrap_or("(unknown app server)");
+    let text = format!(
+        "Remove app server '{}' ?\n\nThis only removes the saved configuration.\n\nPress 'y' to confirm, 'n' or Esc to cancel",
+        target
+    );
+    let area = centered_rect(50, 20, f.area());
+    f.render_widget(Clear, area);
+    let paragraph = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Confirm Delete")
+            .border_style(Style::default().fg(Color::Red)),
+    );
+    f.render_widget(paragraph, area);
 }
 
 fn ui_document_create(f: &mut Frame, app: &App) {
